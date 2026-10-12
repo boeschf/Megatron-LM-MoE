@@ -55,6 +55,11 @@ else:
     TELinear, te_checkpoint = None, None
 
 
+
+import os as _os
+
+_BEVERIN_EXPERT_RECOMPUTE = _os.environ.get("BEVERIN_EXPERT_RECOMPUTE", "0") == "1"
+
 class ExpertsInterface(Protocol):
     """Interface for the experts used in an MoELayer."""
 
@@ -488,6 +493,13 @@ class MoELayer(BaseMoELayer):
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+            )
+        elif _BEVERIN_EXPERT_RECOMPUTE and self.training and not self.moe_layer_recompute:
+            # beverin-rocm: recompute only the expert MLP (fc1/act/fc2) in backward, keeping the
+            # dispatched tokens; unlike the "moe" recompute this does not repeat router, permutation
+            # and the dispatch/combine all-to-alls. Enabled with BEVERIN_EXPERT_RECOMPUTE=1.
+            expert_output, mlp_bias = tensor_parallel.checkpoint(
+                apply_module(self.experts), False, dispatched_input, tokens_per_expert, permuted_probs
             )
         else:
             expert_output, mlp_bias = apply_module(self.experts)(

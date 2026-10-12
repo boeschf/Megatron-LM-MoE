@@ -22,7 +22,25 @@ def _ops():
             grouped_gemm_variable_k_impl,
         )
 
-        _CK = (BackendType.CK.value, grouped_gemm_compute_offs, grouped_gemm_impl,
+        try:  # smallscale-0004: origami raises ValueError (vector::reserve) for some shapes, but
+            # _safe_rank_configs only catches RuntimeError; fall back to the default tile config.
+            import primus_turbo.triton.gemm.gemm_kernel as _gk
+
+            _orig_rank = _gk._safe_rank_configs
+
+            def _safe_rank_configs(problem, hardware, configs):
+                try:
+                    return _orig_rank(problem, hardware, configs)
+                except Exception:
+                    return []
+
+            _gk._safe_rank_configs = _safe_rank_configs
+        except ImportError:
+            pass
+        # BEVERIN_TURBO_GG_BACKEND=CK|TRITON (smallscale gg_bench, job 677157: Triton 14 to 31% faster
+        # than CK on varying per-expert shapes, wgrad 1.4 to 1.6x)
+        _be = getattr(BackendType, os.environ.get("BEVERIN_TURBO_GG_BACKEND", "CK")).value
+        _CK = (_be, grouped_gemm_compute_offs, grouped_gemm_impl,
                grouped_gemm_variable_k_impl)
     return _CK
 
