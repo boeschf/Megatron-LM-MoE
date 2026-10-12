@@ -3154,6 +3154,8 @@ def train(
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
+            from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
+            _a2alog.flush(iteration + 1)
             ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(

@@ -424,6 +424,8 @@ class _AllToAll(torch.autograd.Function):
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
+        from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
+        ctx.a2a_layer = _a2alog.current_layer()
 
         world_size = group.size()
         # Bypass the function if we are using only 1 GPU.
@@ -441,24 +443,16 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
-            output,
-            input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
+        _a2alog.a2a("cf", output, input, output_split_sizes, input_split_sizes, group)
         return output
 
     @staticmethod
     def backward(ctx, *grad_output):
         """Backward function."""
-        return (
-            None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
-            None,
-            None,
-        )
+        from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
+        with _a2alog.kind("cb", ctx.a2a_layer):
+            g = _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes)
+        return (None, g, None, None)
 
 
 # -----------------

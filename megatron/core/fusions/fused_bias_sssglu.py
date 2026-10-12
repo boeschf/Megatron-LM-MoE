@@ -8,6 +8,11 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
+import os as _os
+# beverin-rocm (lab T4): BEVERIN_TRITON_SSSGLU=1 runs SSSGLU as one fused Triton kernel per
+# direction (beverin_sssglu.py) instead of the eager @jit_fuser ops (TORCH_COMPILE_DISABLE=1).
+_BEVERIN_TRITON = _os.environ.get("BEVERIN_TRITON_SSSGLU", "0") == "1"
+
 ###### BIAS SSSGLU FUSION/ NO AUTOGRAD ################
 # SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign:
 #   gate(x)  = softsign(x - 1) + 0.5 = (x - 1) / (1 + |x - 1|) + 0.5   (== sssglu_act in activations.py)
@@ -203,7 +208,11 @@ def bias_sssglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
-    if bias is not None:
+    if _BEVERIN_TRITON and bias is None and not fp8_input_store and not cpu_offload_input:
+        from megatron.core.fusions.beverin_sssglu import TritonSSSGLU
+
+        output = TritonSSSGLU.apply(input)
+    elif bias is not None:
         output = BiasSSSGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
     else:
         output = SSSGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
@@ -220,6 +229,10 @@ def weighted_bias_sssglu_impl(input, bias, weights, fp8_input_store=False):
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted sssglu fusion")
+    elif _BEVERIN_TRITON and not fp8_input_store:
+        from megatron.core.fusions.beverin_sssglu import TritonWeightedSSSGLU
+
+        output = TritonWeightedSSSGLU.apply(input, weights)
     else:
         output = WeightedSSSGLUFunction.apply(input, weights, fp8_input_store)
 

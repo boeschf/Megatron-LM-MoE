@@ -60,6 +60,27 @@ import os as _os
 
 _BEVERIN_EXPERT_RECOMPUTE = _os.environ.get("BEVERIN_EXPERT_RECOMPUTE", "0") == "1"
 
+
+def _beverin_parse_layers(s):
+    out = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+# beverin lab T1: MoE layers (global, 1-based layer numbers) that skip the full "moe" recompute and use
+# expert-only recompute (BEVERIN_LIGHT_MODE=expert, default) or no MoE recompute (none). For stages with
+# spare memory (the last stage has the fewest microbatches in flight).
+_BEVERIN_LIGHT_LAYERS = _beverin_parse_layers(_os.environ.get("BEVERIN_LIGHT_LAYERS", ""))
+_BEVERIN_LIGHT_MODE = _os.environ.get("BEVERIN_LIGHT_MODE", "expert")
+
 class ExpertsInterface(Protocol):
     """Interface for the experts used in an MoELayer."""
 
@@ -287,7 +308,13 @@ class MoELayer(BaseMoELayer):
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "alltoall":
-            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+            # beverin-rocm (lab T6): BEVERIN_T6_EP=1 selects the hierarchical, rail-aligned dispatcher
+            from megatron.core.transformer.moe import beverin_t6_dispatcher as _bt6
+
+            _a2a_cls = (
+                _bt6.BeverinT6AlltoAllTokenDispatcher if _bt6.ENABLED else MoEAlltoAllTokenDispatcher
+            )
+            self.token_dispatcher = _a2a_cls(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
@@ -435,6 +462,8 @@ class MoELayer(BaseMoELayer):
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, hidden_states_sf: Optional[torch.Tensor], probs: torch.Tensor):
+        from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
+        _a2alog.set_layer(self.layer_number)
         """Dispatches tokens to assigned expert ranks via communication.
 
         This method performs the actual communication (e.g., All-to-All) to distribute
@@ -494,7 +523,10 @@ class MoELayer(BaseMoELayer):
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
-        elif _BEVERIN_EXPERT_RECOMPUTE and self.training and not self.moe_layer_recompute:
+        elif self.training and (
+            (_BEVERIN_EXPERT_RECOMPUTE and not self.moe_layer_recompute)
+            or (self.layer_number in _BEVERIN_LIGHT_LAYERS and _BEVERIN_LIGHT_MODE == "expert")
+        ):
             # beverin-rocm: recompute only the expert MLP (fc1/act/fc2) in backward, keeping the
             # dispatched tokens; unlike the "moe" recompute this does not repeat router, permutation
             # and the dispatch/combine all-to-alls. Enabled with BEVERIN_EXPERT_RECOMPUTE=1.
@@ -511,6 +543,8 @@ class MoELayer(BaseMoELayer):
         return output, mlp_bias
 
     def combine(self, output: torch.Tensor):
+        from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
+        _a2alog.set_layer(self.layer_number)
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
@@ -633,7 +667,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute and self.training:
+        if self.moe_layer_recompute and self.training and self.layer_number not in _BEVERIN_LIGHT_LAYERS:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,

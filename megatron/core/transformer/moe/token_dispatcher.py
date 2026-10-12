@@ -357,6 +357,22 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         """Restores the original tensor shape."""
         return hidden_states.view(self.hidden_shape)
 
+from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
+
+import os as _os
+_FP8_DISPATCH = _os.environ.get("BEVERIN_FP8_DISPATCH", "0") == "1"
+_FUSE_PROBS = _os.environ.get("BEVERIN_FUSE_PROBS", "0") == "1" or _FP8_DISPATCH
+
+
+def _beverin_fp8_quant(x):
+    # Per-token, 128-element groups, e4m3fn with amax/448 scales (as per_token_cast_to_fp8, use_ue8m0=False).
+    n, h = x.shape
+    xv = x.view(n, h // 128, 128).float()
+    sf = (xv.abs().amax(-1) / 448.0).clamp_(min=1e-30)
+    q = (xv / sf.unsqueeze(-1)).to(torch.float8_e4m3fn).view(n, h).view(torch.uint8)
+    return q, sf
+
+
 class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
 
     @staticmethod
@@ -365,6 +381,7 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         input,
         output_split_sizes=None,
         input_split_sizes=None,
+        kind="dt",
     ):
         world_size = group.size()
         # Bypass the function if we are using only 1 GPU.
@@ -382,13 +399,7 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
-            output,
-            input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
+        _a2alog.a2a(kind, output, input, output_split_sizes, input_split_sizes, group)
 
         return output
 
@@ -405,10 +416,50 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         ctx.ep_group = ep_group
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
+        ctx.a2a_layer = _a2alog.current_layer()
+
+        ctx.fused_probs = (
+            _FUSE_PROBS
+            and permutated_local_input_tokens_sf is None
+            and permutated_local_input_tokens.dtype == torch.bfloat16
+            and permuted_probs is not None
+            and permuted_probs.dtype == torch.float32
+            and permuted_probs.dim() == 1
+            and permutated_local_input_tokens.dim() == 2
+        )
+        if ctx.fused_probs and _FP8_DISPATCH and permutated_local_input_tokens.shape[1] % 128 == 0:
+            # Asymmetric fp8 dispatch (forward fp8, backward bf16 via the packed path below): one uint8
+            # all-to-all carrying fp8 tokens, fp32 group scales and fp32 probs.
+            n, h = permutated_local_input_tokens.shape
+            g = h // 128
+            q, sf = _beverin_fp8_quant(permutated_local_input_tokens)
+            packed = torch.cat(
+                [q, sf.view(torch.uint8).view(n, 4 * g), permuted_probs.contiguous().view(torch.uint8).view(n, 4)], dim=1
+            )
+            out = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, packed, output_splits, input_splits, "dt"
+            )
+            m = out.shape[0]
+            q2 = out[:, :h].contiguous().view(torch.float8_e4m3fn)
+            sf2 = out[:, h : h + 4 * g].contiguous().view(torch.float32)
+            global_probs = out[:, h + 4 * g :].contiguous().view(torch.float32).view(-1)
+            global_input_tokens = (q2.float().view(m, g, 128) * sf2.view(m, g, 1)).to(torch.bfloat16).view(m, h)
+            return global_input_tokens, None, global_probs
+        if ctx.fused_probs:
+            n, h = permutated_local_input_tokens.shape
+            packed = torch.cat(
+                [permutated_local_input_tokens, permuted_probs.contiguous().view(torch.bfloat16).view(n, 2)], dim=1
+            )
+            out = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, packed, output_splits, input_splits, "dt"
+            )
+            global_input_tokens = out[:, :h].contiguous()
+            global_probs = out[:, h:].contiguous().view(torch.float32).view(-1)
+            return global_input_tokens, None, global_probs
 
         # dispatch probs
         global_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-            ep_group, permuted_probs, output_splits, input_splits
+            ep_group, permuted_probs, output_splits, input_splits, "dp"
         )
 
         # dispatch tokens
@@ -439,12 +490,26 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         input_splits = ctx.input_splits
 
         # The backward of token dispatch is the same as token combine.
-        global_grad_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-            ep_group, grad_probs, input_splits, output_splits
-        )
-        global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-            ep_group, grad_hidden_states, input_splits, output_splits
-        )
+        if ctx.fused_probs and grad_hidden_states is not None and grad_probs is not None:
+            m, h = grad_hidden_states.shape
+            packed = torch.cat(
+                [grad_hidden_states.to(torch.bfloat16), grad_probs.to(torch.float32).contiguous().view(torch.bfloat16).view(m, 2)], dim=1
+            )
+            with _a2alog.kind("bt", ctx.a2a_layer):
+                out = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                    ep_group, packed, input_splits, output_splits, "bt"
+                )
+            g_h = out[:, :h].contiguous().to(grad_hidden_states.dtype)
+            g_p = out[:, h:].contiguous().view(torch.float32).view(-1)
+            return None, None, None, g_h, None, g_p
+        with _a2alog.kind("bp", ctx.a2a_layer):
+            global_grad_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, grad_probs, input_splits, output_splits, "bp"
+            )
+        with _a2alog.kind("bt", ctx.a2a_layer):
+            global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, grad_hidden_states, input_splits, output_splits, "bt"
+            )
         # Slots 4/5 are the (non-tensor group/splits) and scale-factor forward args, whose
         # grads are always None.
         return None, None, None, global_grad_hidden_states, None, global_grad_probs
