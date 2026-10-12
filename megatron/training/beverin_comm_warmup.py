@@ -62,13 +62,19 @@ def _connect(args):
     t0 = time.time()
     numel = args.seq_length * args.micro_batch_size * args.hidden_size  # one PP activation
     x = torch.ones(1 << 20, device="cuda")
+    # BEVERIN_COMM_WARMUP_PARTS (default "ar,p2p,a2a"): which connections to make early. In the full
+    # PP4 EP16 run the p2p/a2a parts are made in the first microbatch anyway (low memory); "ar" covers the
+    # all-reduces that otherwise connect lazily at the end of step 1 (expert bias, aux losses, grads).
+    parts = os.environ.get("BEVERIN_COMM_WARMUP_PARTS", "ar,p2p,a2a").split(",")
     groups = _groups()
-    for _, g in groups:
-        dist.all_reduce(x, group=g)
-    _p2p(numel, batched=True)
-    _p2p(numel, batched=False)
+    if "ar" in parts:
+        for _, g in groups:
+            dist.all_reduce(x, group=g)
+    if "p2p" in parts:
+        _p2p(numel, batched=True)
+        _p2p(numel, batched=False)
     ep = ps.get_expert_model_parallel_group()
-    if dist.get_world_size(ep) > 1:
+    if "a2a" in parts and dist.get_world_size(ep) > 1:
         a = torch.ones(numel * 2, dtype=torch.bfloat16, device="cuda")  # ~ a dispatch all-to-all
         b = torch.empty_like(a)
         dist.all_to_all_single(b, a, group=ep)
@@ -76,7 +82,7 @@ def _connect(args):
     torch.cuda.synchronize()
     dist.barrier()
     if dist.get_rank() == 0:
-        print(f"[beverin] comm warm-up: {len(groups)} NCCL groups + PP p2p + EP all-to-all connected "
+        print(f"[beverin] comm warm-up ({parts}): {len(groups)} NCCL groups "
               f"in {time.time() - t0:.1f} s", flush=True)
 
 
