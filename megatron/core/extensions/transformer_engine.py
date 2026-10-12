@@ -2719,6 +2719,7 @@ try:
         _get_workspace = get_workspace
     except ImportError:
         _get_workspace = None
+    import inspect as _inspect
 
     def te_general_gemm(
         A: torch.Tensor,
@@ -2752,7 +2753,8 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
-        if _get_workspace is not None:
+        # ROCm TE 2.12 general_gemm has no workspace kwarg (beverin-rocm patch)
+        if _get_workspace is not None and "workspace" in _inspect.signature(general_gemm).parameters:
             kwargs["workspace"] = _get_workspace()
         return general_gemm(A, B, **kwargs)
 

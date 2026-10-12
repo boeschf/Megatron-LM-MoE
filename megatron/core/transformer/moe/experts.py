@@ -119,6 +119,8 @@ from megatron.core.tensor_parallel.layers import (
 )
 
 
+from megatron.core.transformer.moe import beverin_turbo as _beverin_turbo
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -594,6 +596,11 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        _turbo = _beverin_turbo.ENABLED and not (self.config.fp8 or self.config.fp4)
+        if _turbo:
+            group_lens = tokens_per_expert.to(
+                device=permuted_local_hidden_states.device, dtype=torch.int64
+            )
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
@@ -640,9 +647,15 @@ class TEGroupedMLP(MegatronModule):
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+            if _turbo:
+                fc1_output = _beverin_turbo.expert_linear(
+                    self.linear_fc1, permuted_local_hidden_states, group_lens
+                )
+                bias_parallel = None
+            else:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
         if self.offload_expert_fc1:
             fc1_output = off_interface.group_commit(
                 fc1_output,
@@ -666,7 +679,11 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = self.bias_act_func(
                     fc1_output, bias_parallel, permuted_probs, tokens_per_expert
                 )
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        if _turbo:
+            output = _beverin_turbo.expert_linear(self.linear_fc2, bias_act_output, group_lens)
+            output_bias = None
+        else:
+            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
