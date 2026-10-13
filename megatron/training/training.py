@@ -3022,6 +3022,10 @@ def train(
             optimizers=[optimizer],
         )
 
+    # Beverin lab T5: pre-warm every model chunk on all ranks in parallel (BEVERIN_PREWARM=1, default off).
+    from megatron.training.beverin_prewarm import maybe_prewarm
+    maybe_prewarm(forward_step_func, model, config, optimizer)
+
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
