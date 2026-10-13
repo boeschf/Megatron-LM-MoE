@@ -185,6 +185,22 @@ def _pad16(n):
 _GROUPS = {}
 
 
+def _pg_options(which):
+    """Optional per-communicator RCCL CTA (channel) limits, e.g. BEVERIN_T6_RAIL_MAX_CTAS=8 to leave CUs to compute
+    under EP overlap while the intra-node stage keeps all channels (a global NCCL_MAX_NCHANNELS=8 makes the node stage
+    2.7x slower)."""
+    mx = os.environ.get(f"BEVERIN_T6_{which}_MAX_CTAS")
+    mn = os.environ.get(f"BEVERIN_T6_{which}_MIN_CTAS")
+    if not (mx or mn):
+        return None
+    opts = dist.ProcessGroupNCCL.Options()
+    if mx:
+        opts.config.max_ctas = int(mx)
+    if mn:
+        opts.config.min_ctas = int(mn)
+    return opts
+
+
 def _subgroups(ep_group, gpn):
     """(rail group, node group) for this rank, cached per EP group. Only the member ranks call new_group
     (use_local_synchronization), so pipeline stages with different layer counts do not have to agree."""
@@ -195,8 +211,8 @@ def _subgroups(ep_group, gpn):
         node, local = divmod(me, gpn)
         rail = [ranks[m * gpn + local] for m in range(len(ranks) // gpn)]
         nodeg = ranks[node * gpn:(node + 1) * gpn]
-        g_rail = dist.new_group(rail, use_local_synchronization=True)
-        g_node = dist.new_group(nodeg, use_local_synchronization=True)
+        g_rail = dist.new_group(rail, use_local_synchronization=True, pg_options=_pg_options("RAIL"))
+        g_node = dist.new_group(nodeg, use_local_synchronization=True, pg_options=_pg_options("NODE"))
         # connect now (CXI endpoints must be created before memory use grows above ~85 GiB per APU)
         t = torch.zeros(len(rail), dtype=torch.float32, device="cuda")
         dist.all_to_all_single(torch.empty_like(t), t, group=g_rail)
