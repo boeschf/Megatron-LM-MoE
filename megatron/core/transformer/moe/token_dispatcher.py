@@ -362,6 +362,7 @@ from megatron.core.transformer.moe import beverin_a2a_log as _a2alog
 import os as _os
 _FP8_DISPATCH = _os.environ.get("BEVERIN_FP8_DISPATCH", "0") == "1"
 _FUSE_PROBS = _os.environ.get("BEVERIN_FUSE_PROBS", "0") == "1" or _FP8_DISPATCH
+_FP8_FUSED_PACK = _os.environ.get("BEVERIN_FP8_FUSED_PACK", "0") == "1"  # lab T4: one Triton kernel each way
 
 
 def _beverin_fp8_quant(x):
@@ -432,13 +433,23 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
             # all-to-all carrying fp8 tokens, fp32 group scales and fp32 probs.
             n, h = permutated_local_input_tokens.shape
             g = h // 128
-            q, sf = _beverin_fp8_quant(permutated_local_input_tokens)
-            packed = torch.cat(
-                [q, sf.view(torch.uint8).view(n, 4 * g), permuted_probs.contiguous().view(torch.uint8).view(n, 4)], dim=1
-            )
+            if _FP8_FUSED_PACK:
+                from megatron.core.transformer.moe.beverin_fp8pack import pack as _t4_pack
+
+                packed = _t4_pack(permutated_local_input_tokens.contiguous(), permuted_probs.contiguous())
+            else:
+                q, sf = _beverin_fp8_quant(permutated_local_input_tokens)
+                packed = torch.cat(
+                    [q, sf.view(torch.uint8).view(n, 4 * g), permuted_probs.contiguous().view(torch.uint8).view(n, 4)], dim=1
+                )
             out = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
                 ep_group, packed, output_splits, input_splits, "dt"
             )
+            if _FP8_FUSED_PACK:
+                from megatron.core.transformer.moe.beverin_fp8pack import unpack as _t4_unpack
+
+                global_input_tokens, global_probs = _t4_unpack(out, h)
+                return global_input_tokens, None, global_probs
             m = out.shape[0]
             q2 = out[:, :h].contiguous().view(torch.float8_e4m3fn)
             sf2 = out[:, h : h + 4 * g].contiguous().view(torch.float32)
