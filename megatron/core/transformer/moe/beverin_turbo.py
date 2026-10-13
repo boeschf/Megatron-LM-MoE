@@ -7,6 +7,35 @@ import os
 import torch
 
 ENABLED = os.environ.get("BEVERIN_TURBO_GG", "0") == "1"
+_TRITON = os.environ.get("BEVERIN_TURBO_GG_BACKEND", "CK") == "TRITON"
+PTR = os.environ.get("BEVERIN_TURBO_PTR", "0") == "1" and _TRITON  # lab T4
+FUSED_WGRAD = os.environ.get("BEVERIN_TURBO_FUSED_WGRAD", "0") == "1"  # lab T4, any backend (wgrad kernel is Triton)
+_GOFF = {}
+_DUMMY = {}
+
+
+def _offsets(tensors):
+    """(lowest-address tensor, int64 element offsets of every tensor from it). Offsets are >= 0 (the AMD Triton
+    buffer-load path miscomputes negative ones) and must fit in 2 GiB of bytes."""
+    key = tuple(t.data_ptr() for t in tensors)
+    hit = _GOFF.get(key)
+    if hit is None:
+        if len(_GOFF) > 4096:
+            _GOFF.clear()
+        base = min(tensors, key=lambda t: t.data_ptr())
+        e = base.element_size()
+        offs = [(k - base.data_ptr()) // e for k in key]
+        assert all(o >= 0 for o in offs) and max(offs) * e + tensors[0].numel() * e < 2**31, "expert span > 2 GiB"
+        hit = _GOFF[key] = (base, torch.tensor(offs, dtype=torch.int64, device=base.device))
+    return hit
+
+
+def _dummy_grad(w):
+    key = (tuple(w.shape), w.dtype, w.device)
+    t = _DUMMY.get(key)
+    if t is None:
+        t = _DUMMY[key] = torch.zeros(w.shape, dtype=w.dtype, device=w.device)
+    return t
 _CK = None
 
 
@@ -65,10 +94,16 @@ class _TurboExpertLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, group_lens, *weights):
         ck, compute_offs, gg, gg_vk = _ops()
-        w = _stacked_view(weights)
         offs = compute_offs(group_lens)
-        out = gg(x, w, group_lens, offs, trans_a=False, trans_b=True, num_cu=None,
-                 default_backend=ck, maybe_pre_sync=True)
+        if PTR and all(w.is_contiguous() for w in weights):
+            from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
+
+            wb, goff = _offsets([w.detach() for w in weights])
+            out = grouped_gemm_ptr(x, wb.unsqueeze(0), offs, goff, trans_b=True)
+        else:
+            w = _stacked_view(weights)
+            out = gg(x, w, group_lens, offs, trans_a=False, trans_b=True, num_cu=None,
+                     default_backend=ck, maybe_pre_sync=True)
         ctx.save_for_backward(x, group_lens, offs)
         ctx.weights = weights
         return out
@@ -80,9 +115,25 @@ class _TurboExpertLinear(torch.autograd.Function):
         weights = ctx.weights
         ctx.weights = None
         grad_out = grad_out.contiguous()
-        w = _stacked_view(weights)
-        grad_x = gg(grad_out, w, group_lens, offs, trans_a=False, trans_b=False, num_cu=None,
-                    default_backend=ck)
+        if PTR and all(w.is_contiguous() for w in weights):
+            from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
+
+            wb, goff = _offsets([w.detach() for w in weights])
+            grad_x = grouped_gemm_ptr(grad_out, wb.unsqueeze(0), offs, goff, trans_b=False)
+        else:
+            w = _stacked_view(weights)
+            grad_x = gg(grad_out, w, group_lens, offs, trans_a=False, trans_b=False, num_cu=None,
+                        default_backend=ck)
+        mgs = [getattr(w, "main_grad", None) for w in weights]
+        if (FUSED_WGRAD and all(m is not None and m.dtype == torch.float32 and m.is_contiguous() for m in mgs)
+                and x.is_contiguous()):
+            from megatron.core.transformer.moe.beverin_vk import vk_accum
+
+            mb, moff = _offsets(mgs)
+            vk_accum(grad_out, x, offs, mb, moff)
+            for w in weights:
+                w.grad_added_to_main_grad = True
+            return (grad_x, None, *[_dummy_grad(w) for w in weights])
         grad_w = gg_vk(x, grad_out, group_lens, offs, trans_a=True, trans_b=False, trans_c=True,
                        num_cu=None, default_backend=ck)
         return (grad_x, None, *grad_w.unbind(0))
