@@ -252,6 +252,9 @@ class _ParamAndGradBucketGroup:
         """
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             # Record golden per_param_grad_ready_counts.
+            if len(self.per_param_grad_ready_counts) != len(self.params):  # beverin-rocm (T3): name the culprits
+                miss = [getattr(p, "_beverin_name", tuple(p.shape)) for p in self.params if p not in self.per_param_grad_ready_counts]
+                print(f"[beverin] params without a grad-ready hook in step 1 ({len(miss)}): {miss[:40]}", flush=True)
             assert len(self.per_param_grad_ready_counts) == len(self.params)
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
             self.is_first_batch = False

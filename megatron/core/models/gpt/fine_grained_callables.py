@@ -721,6 +721,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
+        # beverin-rocm (T3): apply the sandwich norm / residual output scale / KEEL exactly as
+        # TransformerLayer._forward_post_mlp does. The EP-overlap path skipped them, so MoE layers
+        # computed a different function and post_mlp_layernorm got no gradient (step-2 assertion
+        # at PP1, grad-sync stall with overlapped grad reduce at PP4, job 677407).
+        _keel = getattr(layer, "keel", False)
+        if _keel:
+            residual = layer.keel_residual_scale * residual
+        else:
+            mlp_output_with_bias = layer._apply_post_norm(mlp_output_with_bias, layer.post_mlp_layernorm)
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
@@ -731,6 +740,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             hidden_states = off_interface.group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
+        if _keel:
+            hidden_states = apply_module(layer.post_mlp_layernorm)(hidden_states)
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

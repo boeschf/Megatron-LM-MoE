@@ -118,6 +118,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
+            param._beverin_name = name  # beverin-rocm (T3): for diagnostics
 
             if getattr(param, 'allreduce', True):
                 dense_params.append((param, name))
