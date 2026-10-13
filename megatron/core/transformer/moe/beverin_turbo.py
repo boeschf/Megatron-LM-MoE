@@ -10,6 +10,9 @@ ENABLED = os.environ.get("BEVERIN_TURBO_GG", "0") == "1"
 _TRITON = os.environ.get("BEVERIN_TURBO_GG_BACKEND", "CK") == "TRITON"
 PTR = os.environ.get("BEVERIN_TURBO_PTR", "0") == "1" and _TRITON  # lab T4
 FUSED_WGRAD = os.environ.get("BEVERIN_TURBO_FUSED_WGRAD", "0") == "1"  # lab T4, any backend (wgrad kernel is Triton)
+# lab T3: honour --delay-wgrad-compute (needed by the EP-overlap schedule) by queueing the expert wgrad in the
+# TE module's own WeightGradStore; TE GroupedLinear.backward_dw() then pops it and fires the DDP hooks.
+DELAY_WGRAD = os.environ.get("BEVERIN_TURBO_DELAY_WGRAD", "0") == "1"
 _GOFF = {}
 _DUMMY = {}
 
@@ -92,7 +95,7 @@ class _TurboExpertLinear(torch.autograd.Function):
     """out = x_g @ W_g^T per expert group g; W_g has TE layout [out, in]."""
 
     @staticmethod
-    def forward(ctx, x, group_lens, *weights):
+    def forward(ctx, x, group_lens, module, *weights):
         ck, compute_offs, gg, gg_vk = _ops()
         offs = compute_offs(group_lens)
         if PTR and all(w.is_contiguous() for w in weights):
@@ -106,6 +109,7 @@ class _TurboExpertLinear(torch.autograd.Function):
                      default_backend=ck, maybe_pre_sync=True)
         ctx.save_for_backward(x, group_lens, offs)
         ctx.weights = weights
+        ctx.module = module
         return out
 
     @staticmethod
@@ -114,6 +118,7 @@ class _TurboExpertLinear(torch.autograd.Function):
         x, group_lens, offs = ctx.saved_tensors
         weights = ctx.weights
         ctx.weights = None
+        module, ctx.module = ctx.module, None
         grad_out = grad_out.contiguous()
         if PTR and all(w.is_contiguous() for w in weights):
             from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
@@ -124,6 +129,13 @@ class _TurboExpertLinear(torch.autograd.Function):
             w = _stacked_view(weights)
             grad_x = gg(grad_out, w, group_lens, offs, trans_a=False, trans_b=False, num_cu=None,
                         default_backend=ck)
+        store = getattr(module, "wgrad_store", None) if module is not None else None
+        if DELAY_WGRAD and store is not None and store.delay_wgrad_compute():
+            wl = []  # filled by _delayed_wgrad; TE reads it only when wgrad accumulation fusion is off
+            store.put([x, grad_out, wl, group_lens, offs, weights, bool(getattr(module, "fuse_wgrad_accumulation", True))],
+                      _delayed_wgrad)
+            # zero placeholder grads: DDP's delayed hook (fired from backward_dw) asserts param.grad is set
+            return (grad_x, None, None, *[_dummy_grad(w) for w in weights])
         mgs = [getattr(w, "main_grad", None) for w in weights]
         if (FUSED_WGRAD and all(m is not None and m.dtype == torch.float32 and m.is_contiguous() for m in mgs)
                 and x.is_contiguous()):
@@ -133,15 +145,47 @@ class _TurboExpertLinear(torch.autograd.Function):
             vk_accum(grad_out, x, offs, mb, moff)
             for w in weights:
                 w.grad_added_to_main_grad = True
-            return (grad_x, None, *[_dummy_grad(w) for w in weights])
+            return (grad_x, None, None, *[_dummy_grad(w) for w in weights])
         grad_w = gg_vk(x, grad_out, group_lens, offs, trans_a=True, trans_b=False, trans_c=True,
                        num_cu=None, default_backend=ck)
-        return (grad_x, None, *grad_w.unbind(0))
+        return (grad_x, None, None, *grad_w.unbind(0))
+
+
+def _delayed_wgrad(x, grad_out, wl, group_lens, offs, weights, fuse=True):
+    """Expert wgrad for TE GroupedLinear.backward_dw (lab T3): accumulate into main_grad when it exists (TE's
+    wgrad accumulation fusion), else leave the per-expert wgrads in `wl` for TE to assign to .grad."""
+    ck, _, gg, gg_vk = _ops()
+    if x is None:  # empty-input placeholder (autograd already gave the weights zero grads)
+        if not fuse:
+            wl.extend(torch.zeros_like(w) for w in weights)
+        return None, [None] * len(weights), None
+    mgs = [getattr(w, "main_grad", None) for w in weights] if fuse else [None] * len(weights)
+    if (FUSED_WGRAD and all(m is not None and m.dtype == torch.float32 and m.is_contiguous() for m in mgs)
+            and x.is_contiguous()):
+        from megatron.core.transformer.moe.beverin_vk import vk_accum
+
+        mb, moff = _offsets(mgs)
+        vk_accum(grad_out, x, offs, mb, moff)
+        for w in weights:
+            w.grad_added_to_main_grad = True
+    else:
+        grad_w = gg_vk(x, grad_out, group_lens, offs, trans_a=True, trans_b=False, trans_c=True,
+                       num_cu=None, default_backend=ck)
+        if all(m is not None for m in mgs):
+            for w, m, g in zip(weights, mgs, grad_w.unbind(0)):
+                m.add_(g)
+                w.grad_added_to_main_grad = True
+        else:
+            wl.extend(grad_w.unbind(0))
+    return None, [None] * len(weights), None
 
 
 def expert_linear(te_grouped_linear, x, group_lens):
     n = te_grouped_linear.num_gemms
     weights = [getattr(te_grouped_linear, f"weight{i}") for i in range(n)]
     if x.shape[0] == 0:
+        store = getattr(te_grouped_linear, "wgrad_store", None)
+        if DELAY_WGRAD and store is not None and store.delay_wgrad_compute() and torch.is_grad_enabled():
+            store.put([None, None, [], None, None, weights, True], _delayed_wgrad)  # keep backward_dw balanced
         return x.new_zeros((0, weights[0].shape[0])) + 0 * sum(w.sum() for w in weights)
-    return _TurboExpertLinear.apply(x, group_lens, *weights)
+    return _TurboExpertLinear.apply(x, group_lens, te_grouped_linear, *weights)
