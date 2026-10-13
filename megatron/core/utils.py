@@ -1128,16 +1128,10 @@ def drain_embedding_wgrad_compute(
             weight.main_grad = weight.get_main_grad()
 
         if config.gradient_accumulation_fusion:
-            if weight.main_grad.dtype == torch.float32:
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                    all_gathered_input, grad_output, weight.main_grad
-                )
-            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                    all_gathered_input, grad_output, weight.main_grad
-                )
-            else:
-                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+            # beverin-rocm (lab T4): shared helper, TE path when a hipBLASLt override file is set
+            from megatron.core.tensor_parallel.layers import beverin_wgrad_accum
+
+            beverin_wgrad_accum(all_gathered_input, grad_output, weight.main_grad)
 
     # We have all_gathered_input list acting as a double buffer here,
     # since we are pipelining the AllGather and GEMM,one buffer all gathers
