@@ -5,6 +5,45 @@
 from __future__ import annotations
 
 import os
+
+# lab T4: LM-head (non-TE) wgrad through TE general_gemm. Forced on whenever a hipBLASLt tuning override file is
+# set, because apex wgrad_gemm_accum_fp32 silently computes nothing with tuned solutions (lab/t4, job 677999).
+_BEVERIN_HIPBLASLT_OVERRIDE = bool(os.environ.get("HIPBLASLT_TUNING_OVERRIDE_FILE"))
+_BEVERIN_TE_WGRAD = os.environ.get("BEVERIN_TE_WGRAD", "0") == "1" or _BEVERIN_HIPBLASLT_OVERRIDE
+if _BEVERIN_HIPBLASLT_OVERRIDE and os.environ.get("BEVERIN_TE_WGRAD", "0") != "1":
+    import warnings as _w
+
+    _w.warn("HIPBLASLT_TUNING_OVERRIDE_FILE is set: forcing BEVERIN_TE_WGRAD=1 (apex fused wgrad is unsafe "
+                  "with tuned hipBLASLt solutions)")
+
+
+def beverin_te_mm(a, w, layout):
+    """bf16 a @ w.T (layout "TN", forward) or a @ w (layout "NN", dgrad) via TE general_gemm; a may be 3D."""
+    from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_gg
+
+    a2 = a.reshape(-1, a.shape[-1])
+    out = _te_gg(w, a2, out_dtype=a.dtype, layout=layout, grad=(layout == "NN"))
+    out = out[0] if isinstance(out, (tuple, list)) else out
+    return out.view(*a.shape[:-1], out.shape[-1])
+
+
+def beverin_wgrad_accum(total_input, grad_output, main_grad):
+    """main_grad += grad_output^T @ total_input with fp32 accumulation (gradient accumulation fusion)."""
+    if main_grad.dtype == torch.float32 and _BEVERIN_TE_WGRAD:
+        from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_gg
+
+        _te_gg(total_input, grad_output, out_dtype=torch.float32, layout="NT", out=main_grad,
+               accumulate=True, grad=True)
+    elif main_grad.dtype == torch.float32:
+        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, main_grad)
+    elif main_grad.dtype in (torch.float16, torch.bfloat16):
+        if _BEVERIN_HIPBLASLT_OVERRIDE:
+            raise RuntimeError("HIPBLASLT_TUNING_OVERRIDE_FILE is set but main_grad is "
+                               f"{main_grad.dtype}: apex wgrad_gemm_accum_fp16 is unsafe with tuned "
+                               "hipBLASLt solutions and has no TE replacement in this patch")
+        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, main_grad)
+    else:
+        raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 import warnings
 from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
@@ -478,7 +517,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
-        output = torch.matmul(total_input, weight.t())
+        if _BEVERIN_TE_WGRAD and total_input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
+            output = beverin_te_mm(total_input, weight, "TN")
+        else:
+            output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
         return output
@@ -521,7 +563,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 total_input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight)
+        if _BEVERIN_TE_WGRAD and grad_output.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
+            grad_input = beverin_te_mm(grad_output.contiguous(), weight, "NN")
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
@@ -558,18 +603,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     weight.main_grad = weight.get_main_grad()
                     torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
                 else:
-                    if weight.main_grad.dtype == torch.float32:
-                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                            total_input, grad_output, weight.main_grad
-                        )
-                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                            total_input, grad_output, weight.main_grad
-                        )
-                    else:
-                        raise RuntimeError(
-                            "Unsupported gradient type for gradient accumulation fusion"
-                        )
+                    beverin_wgrad_accum(total_input, grad_output, weight.main_grad)
 
             if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
