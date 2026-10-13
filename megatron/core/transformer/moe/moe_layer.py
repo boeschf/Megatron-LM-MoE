@@ -524,7 +524,11 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         elif self.training and (
-            (_BEVERIN_EXPERT_RECOMPUTE and not self.moe_layer_recompute)
+            (
+                _BEVERIN_EXPERT_RECOMPUTE
+                and not self.moe_layer_recompute
+                and not (self.layer_number in _BEVERIN_LIGHT_LAYERS and _BEVERIN_LIGHT_MODE == "none")
+            )
             or (self.layer_number in _BEVERIN_LIGHT_LAYERS and _BEVERIN_LIGHT_MODE == "expert")
         ):
             # beverin-rocm: recompute only the expert MLP (fc1/act/fc2) in backward, keeping the
