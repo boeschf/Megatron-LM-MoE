@@ -44,6 +44,11 @@ class BeverinT6AlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
 
     def dispatch_postprocess(self, global_input_tokens, global_probs):
         tpe, self._tpe = self._tpe, None
+        if getattr(self.config, "overlap_moe_expert_parallel_comm", False):
+            # The EP-overlap schedule frees the inputs of its "mlp" node after the forward (it assumes that
+            # dispatch_postprocess makes a new tensor, as the plain path's sort does), but the experts save
+            # their input for backward/recompute: hand them a copy.
+            global_input_tokens = global_input_tokens.clone()
         return global_input_tokens, tpe, global_probs
 
     def combine_preprocess(self, hidden_states):
