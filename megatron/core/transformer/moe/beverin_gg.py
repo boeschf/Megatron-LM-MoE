@@ -1,3 +1,4 @@
+import os
 # beverin-rocm (lab T4): Primus-Turbo's persistent Triton grouped GEMM (primus_turbo 0.2.0,
 # triton/grouped_gemm/grouped_gemm_kernel.py, Copyright (c) 2025 Advanced Micro Devices, Inc.) with one change:
 # the weight of group g is found through a per-group element-offset table instead of a [G, N, K] stack.
@@ -220,6 +221,9 @@ def grouped_gemm_ptr(
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
+    _cap = os.environ.get("BEVERIN_TURBO_NUM_CU")  # lab2 A3: persistent grid on fewer CUs
+    if _cap:
+        num_sms = max(NUM_XCDS, min(num_sms, int(_cap)) // NUM_XCDS * NUM_XCDS)
     avg_m = max(M_total // max(G, 1), 256)
     if _is_gfx950():
         _set_knobs_gfx950()

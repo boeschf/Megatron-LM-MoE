@@ -1,3 +1,4 @@
+import os
 # beverin-rocm (lab T4): Primus-Turbo's persistent Triton variable-K grouped GEMM (expert weight gradient; primus_turbo
 # 0.2.0 triton/grouped_gemm/grouped_gemm_kernel.py, Copyright (c) 2025 Advanced Micro Devices, Inc.) changed to
 # accumulate C[g] = grad_out_g^T @ x_g directly into each expert's fp32 main_grad (found through a per-group element
@@ -181,6 +182,9 @@ def vk_accum(lhs, rhs, group_offs, c0, c_goff):
     OUT_M, OUT_N = lhs.shape[1], rhs.shape[1]
     G = group_offs.shape[0] - 1
     num_sms = _get_num_cus()
+    _cap = os.environ.get("BEVERIN_TURBO_NUM_CU")  # lab2 A3: persistent grid on fewer CUs
+    if _cap:
+        num_sms = max(NUM_XCDS, min(num_sms, int(_cap)) // NUM_XCDS * NUM_XCDS)
     dummy = torch.empty(1, device=lhs.device, dtype=torch.float32)
     if _is_gfx950():
         _set_knobs_gfx950()

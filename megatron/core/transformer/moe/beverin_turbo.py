@@ -13,6 +13,9 @@ FUSED_WGRAD = os.environ.get("BEVERIN_TURBO_FUSED_WGRAD", "0") == "1"  # lab T4,
 # lab T3: honour --delay-wgrad-compute (needed by the EP-overlap schedule) by queueing the expert wgrad in the
 # TE module's own WeightGradStore; TE GroupedLinear.backward_dw() then pops it and fires the DDP hooks.
 DELAY_WGRAD = os.environ.get("BEVERIN_TURBO_DELAY_WGRAD", "0") == "1"
+# lab2 A3: BEVERIN_TURBO_NUM_CU=n runs the expert grouped GEMMs (CK fwd/dgrad/wgrad and the fused Triton wgrad) on n
+# CUs only, leaving the rest to the EP all-to-all that overlaps them (--overlap-moe-expert-parallel-comm)
+NUM_CU = int(os.environ["BEVERIN_TURBO_NUM_CU"]) if os.environ.get("BEVERIN_TURBO_NUM_CU") else None
 _GOFF = {}
 _DUMMY = {}
 
@@ -105,7 +108,7 @@ class _TurboExpertLinear(torch.autograd.Function):
             out = grouped_gemm_ptr(x, wb.unsqueeze(0), offs, goff, trans_b=True)
         else:
             w = _stacked_view(weights)
-            out = gg(x, w, group_lens, offs, trans_a=False, trans_b=True, num_cu=None,
+            out = gg(x, w, group_lens, offs, trans_a=False, trans_b=True, num_cu=NUM_CU,
                      default_backend=ck, maybe_pre_sync=True)
         ctx.save_for_backward(x, group_lens, offs)
         ctx.weights = weights
@@ -127,7 +130,7 @@ class _TurboExpertLinear(torch.autograd.Function):
             grad_x = grouped_gemm_ptr(grad_out, wb.unsqueeze(0), offs, goff, trans_b=False)
         else:
             w = _stacked_view(weights)
-            grad_x = gg(grad_out, w, group_lens, offs, trans_a=False, trans_b=False, num_cu=None,
+            grad_x = gg(grad_out, w, group_lens, offs, trans_a=False, trans_b=False, num_cu=NUM_CU,
                         default_backend=ck)
         store = getattr(module, "wgrad_store", None) if module is not None else None
         if DELAY_WGRAD and store is not None and store.delay_wgrad_compute():
@@ -147,7 +150,7 @@ class _TurboExpertLinear(torch.autograd.Function):
                 w.grad_added_to_main_grad = True
             return (grad_x, None, None, *[_dummy_grad(w) for w in weights])
         grad_w = gg_vk(x, grad_out, group_lens, offs, trans_a=True, trans_b=False, trans_c=True,
-                       num_cu=None, default_backend=ck)
+                       num_cu=NUM_CU, default_backend=ck)
         return (grad_x, None, None, *grad_w.unbind(0))
 
 
@@ -171,7 +174,7 @@ def _delayed_wgrad(x, grad_out, wl, group_lens, offs, weights, fuse=True):
             w.grad_added_to_main_grad = True
     else:
         grad_w = gg_vk(x, grad_out, group_lens, offs, trans_a=True, trans_b=False, trans_c=True,
-                       num_cu=None, default_backend=ck)
+                       num_cu=NUM_CU, default_backend=ck)
         if all(m is not None for m in mgs):
             for w, m, g in zip(weights, mgs, grad_w.unbind(0)):
                 m.add_(g)
