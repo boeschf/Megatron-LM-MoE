@@ -335,12 +335,21 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        import os as _os  # lab2 A6
+
+        _unfused = _os.environ.get("BEVERIN_UNFUSED_QKV_NORM", "0") == "1"
+        _keys_map = {"input_layernorm.": "self_attention.linear_qkv.layer_norm_"} if _unfused else {}
         return TransformerLayerSubmodules(
+            input_layernorm=backend.layer_norm(has_residual=True) if _unfused else IdentityOp,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=backend.column_parallel_layer_norm_linear(),
+                    linear_qkv=(
+                        backend.column_parallel_linear()
+                        if _unfused
+                        else backend.column_parallel_layer_norm_linear()
+                    ),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=(
@@ -364,6 +373,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
                 "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
                 "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+                **_keys_map,
             },
         )
 
