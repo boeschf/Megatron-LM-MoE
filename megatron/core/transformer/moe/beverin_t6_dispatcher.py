@@ -40,11 +40,14 @@ class BeverinT6AlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         assert hidden_states_sf is None
         x3, p3, tpe = self.hier.dispatch(hidden_states, probs, self._pl)
         self._tpe = tpe
+        if _t6._STASH:  # lab2 A6: hand the receive buffer to the expert recompute instead of keeping x3
+            r2, rows3, hier, dt = self._pl.pop("r2"), self._pl["rows3"], self.hier, x3.dtype
+            self.stash_rebuild = lambda: hier.rebuild_x3(r2, rows3, dt)
         return x3, None, p3
 
     def dispatch_postprocess(self, global_input_tokens, global_probs):
         tpe, self._tpe = self._tpe, None
-        if getattr(self.config, "overlap_moe_expert_parallel_comm", False):
+        if getattr(self.config, "overlap_moe_expert_parallel_comm", False) and not _t6._STASH:
             # The EP-overlap schedule frees the inputs of its "mlp" node after the forward (it assumes that
             # dispatch_postprocess makes a new tensor, as the plain path's sort does), but the experts save
             # their input for backward/recompute: hand them a copy.

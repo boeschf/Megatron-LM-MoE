@@ -22,6 +22,7 @@ _TIMING = os.environ.get("BEVERIN_T6_TIMING", "0") == "1"
 # all-gather, already on the device), so the turbo expert MLP does no blocking H2D copy (forward and expert recompute).
 _DEVTPE = os.environ.get("BEVERIN_T6_DEVTPE", "0") == "1"
 _QB = 128  # fp8 block: columns per scale
+_STASH = os.environ.get("BEVERIN_DISPATCH_STASH", "0") == "1"  # lab2 A6: keep r2 for the expert recompute
 TIMES = {}
 
 
@@ -342,7 +343,15 @@ class HierEP:
             p3 = r2[:, self.po:self.po + 4 * K].view(torch.float32).reshape(-1).index_select(0, order)
         pl.update(idx1=idx1, inv1=inv1, idx2=idx2, inv2=inv2, rows3=rows3, inv3=inv3.view(R2, K), order=order,
                   R1=R1, R2=R2, xdt=x.dtype, pdt=probs.dtype)
+        if _STASH:
+            pl["r2"] = r2
         return x3, p3
+
+    def rebuild_x3(self, r2, rows3, dtype):
+        """The expert-sorted dispatch output x3 from the node-stage receive buffer (same kernel as the forward)."""
+        if self.fp8:
+            return _dequant_gather(r2, rows3, self.H, dtype)
+        return r2[:, :2 * self.H].view(dtype).index_select(0, rows3)
 
     def _dispatch_bwd(self, gx3, gp3, pl):
         """Mirror of the dispatch: sum the copies back to the source tokens. Returns (grad x [T, H], grad probs)."""

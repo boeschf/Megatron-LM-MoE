@@ -81,6 +81,32 @@ def _beverin_parse_layers(s):
 _BEVERIN_LIGHT_LAYERS = _beverin_parse_layers(_os.environ.get("BEVERIN_LIGHT_LAYERS", ""))
 _BEVERIN_LIGHT_MODE = _os.environ.get("BEVERIN_LIGHT_MODE", "expert")
 
+class _ExpertRecomputeFromStash(torch.autograd.Function):
+    """lab2 A6: expert-only recompute that does not save the dispatched tokens; backward rebuilds them
+    (bit-identical) from the dispatcher's packed receive buffer, then reruns the experts with grad."""
+
+    @staticmethod
+    def forward(ctx, x, probs, tokens_per_expert, fn, rebuild):
+        ctx.fn, ctx.rebuild, ctx.tpe = fn, rebuild, tokens_per_expert
+        ctx.probs_requires_grad = probs.requires_grad
+        ctx.save_for_backward(probs)
+        with torch.no_grad():
+            out, bias = fn(x, tokens_per_expert, probs)
+        assert bias is None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (probs,) = ctx.saved_tensors
+        x = ctx.rebuild().detach().requires_grad_(True)
+        ctx.rebuild = None
+        p = probs.detach().requires_grad_(ctx.probs_requires_grad)
+        with torch.enable_grad():
+            out, _ = ctx.fn(x, ctx.tpe, p)
+        torch.autograd.backward(out, grad_out)
+        return x.grad, (p.grad if ctx.probs_requires_grad else None), None, None, None
+
+
 class ExpertsInterface(Protocol):
     """Interface for the experts used in an MoELayer."""
 
@@ -534,9 +560,18 @@ class MoELayer(BaseMoELayer):
             # beverin-rocm: recompute only the expert MLP (fc1/act/fc2) in backward, keeping the
             # dispatched tokens; unlike the "moe" recompute this does not repeat router, permutation
             # and the dispatch/combine all-to-alls. Enabled with BEVERIN_EXPERT_RECOMPUTE=1.
-            expert_output, mlp_bias = tensor_parallel.checkpoint(
-                apply_module(self.experts), False, dispatched_input, tokens_per_expert, permuted_probs
-            )
+            _rebuild = getattr(self.token_dispatcher, "stash_rebuild", None)
+            if _rebuild is not None:
+                # lab2 A6 (BEVERIN_DISPATCH_STASH=1): recompute from the packed receive buffer, not a saved x3
+                self.token_dispatcher.stash_rebuild = None
+                expert_output = _ExpertRecomputeFromStash.apply(
+                    dispatched_input, permuted_probs, tokens_per_expert, apply_module(self.experts), _rebuild
+                )
+                mlp_bias = None
+            else:
+                expert_output, mlp_bias = tensor_parallel.checkpoint(
+                    apply_module(self.experts), False, dispatched_input, tokens_per_expert, permuted_probs
+                )
         else:
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs

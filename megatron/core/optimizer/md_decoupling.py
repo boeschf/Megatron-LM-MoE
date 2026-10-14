@@ -120,6 +120,55 @@ def _gain_log_family(name: str, param: torch.Tensor) -> str:
     return "other"
 
 
+import os as _os
+
+_BEVERIN_NS_WS = _os.environ.get("BEVERIN_NS_WS", "0") == "1"
+_NS_WS: Dict[tuple, list] = {}
+
+
+def _ns_ws_get(m: int, n: int, device) -> list:
+    key = (m, n, str(device))
+    ws = _NS_WS.get(key)
+    if ws is None:
+        ws = [torch.empty(m, n, dtype=torch.bfloat16, device=device),
+              torch.empty(m, n, dtype=torch.bfloat16, device=device),
+              torch.empty(m, m, dtype=torch.bfloat16, device=device),
+              torch.empty(m, m, dtype=torch.bfloat16, device=device)]
+        _NS_WS[key] = ws
+    return ws
+
+
+def _ns_ws_prealloc(device) -> None:
+    for item in _os.environ.get("BEVERIN_NS_WS_SHAPES", "").split(","):
+        if ":" in item:
+            m, n = (int(v) for v in item.split(":"))
+            _ns_ws_get(min(m, n), max(m, n), device)
+
+
+def _newton_schulz_ws(x: torch.Tensor, steps: int, coefficient_type: str, eps: float = 1e-7):
+    """emerging_optimizers.newton_schulz (2D, bf16 'medium' path) with persistent bf16 buffers."""
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        _COEFFICIENT_SETS,
+        get_coefficient_iterator,
+    )
+
+    transpose = x.size(-2) > x.size(-1)
+    if transpose:
+        x = x.mT
+    m, n = x.shape
+    X, Xn, A, B = _ns_ws_get(m, n, x.device)
+    X.copy_(torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps))
+    coefficient_sets = _COEFFICIENT_SETS[coefficient_type]
+    mode = "repeat_last" if coefficient_type in ("polar_express", "cans", "deepseekv4") else "cycle"
+    for a, b, c in get_coefficient_iterator(steps, coefficient_sets, mode=mode):
+        torch.mm(X, X.mT, out=A)
+        torch.addmm(A, A, A, alpha=c, beta=b, out=B)
+        torch.addmm(X, B, X, alpha=1.0, beta=a, out=Xn)
+        X, Xn = Xn, X
+    out = X.to(torch.float32)
+    return out.mT if transpose else out
+
+
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
@@ -412,6 +461,24 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         for _i, _g in enumerate(self.param_groups):
             _g['lr_mult'] = float(_i + 1)
 
+        if _BEVERIN_NS_WS:
+            _dev = torch.device("cuda", torch.cuda.current_device())
+            _ns_ws_prealloc(_dev)
+            if _os.environ.get("BEVERIN_NS_WS_SHAPES", "") == "auto":
+                _shapes = set()
+                for group in self.param_groups:
+                    if not group.get("use_orthogonal_updates"):
+                        continue
+                    for p in group["params"]:
+                        if p.ndim != 2:
+                            continue
+                        split = self._split_param_tensor(p, p, self.is_qkv_fn(p))
+                        for part in (split[0] if split is not None else [p]):
+                            if part.ndim == 2:
+                                _shapes.add((min(part.shape), max(part.shape)))
+                for m, n in sorted(_shapes):
+                    _ns_ws_get(m, n, _dev)
+
         # Normalize parameters at init so the first forward sees on-sphere weights. When
         # hypersphere_preserve_init=True we skip this so the model's init magnitude survives into
         # training (gains absorb the magnitude downstream in MDDecoupling._maybe_init_gain_state).
@@ -686,14 +753,18 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if partition_dim is not None:
             # Use the global matrix shape for Muon scaling.
             size[partition_dim] *= get_pg_size(tp_group)
-        orth = newton_schulz_tp(
-            grad,
-            steps=self.num_ns_steps,
-            coefficient_type=self.coefficient_type,
-            tp_group=tp_group,
-            partition_dim=partition_dim,
-            tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
-        )
+        if (_BEVERIN_NS_WS and partition_dim is None and grad.dtype == torch.float32
+                and torch.get_float32_matmul_precision() == "medium"):
+            orth = _newton_schulz_ws(grad, self.num_ns_steps, self.coefficient_type)
+        else:
+            orth = newton_schulz_tp(
+                grad,
+                steps=self.num_ns_steps,
+                coefficient_type=self.coefficient_type,
+                tp_group=tp_group,
+                partition_dim=partition_dim,
+                tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
+            )
         scale = _get_muon_scale_factor(size[0], size[1], mode=self._resolve_scale_mode(is_router))
         if flat_mode:
             scale *= self._init_radius_scale(size[0], size[1])
