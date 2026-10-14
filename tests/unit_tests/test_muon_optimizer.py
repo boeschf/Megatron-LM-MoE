@@ -659,6 +659,122 @@ def _record_muon_split_output(param, grad, **muon_kwargs):
     return optimizer.orthogonalize(param, grad), calls
 
 
+def test_muon_glu_fc1_orthogonalizes_gate_and_up_separately():
+    param = torch.nn.Parameter(torch.empty(8, 4, device='cuda'))
+    param.glu_split_dim = 0
+    grad = torch.arange(32, dtype=torch.float32, device='cuda').view_as(param)
+
+    output, calls = _record_muon_split_output(param, grad, split_fc1=True)
+
+    assert [tuple(call.shape) for call in calls] == [(4, 4), (4, 4)]
+    assert torch.equal(output[:4], torch.ones_like(output[:4]))
+    assert torch.equal(output[4:], torch.full_like(output[4:], 2.0))
+
+
+def test_muon_optimizer_kda_in_proj_split_uses_local_dim0_tp_shapes():
+    local_shapes = (2, 2, 3, 3, 1, 4)
+    param = torch.nn.Parameter(torch.empty(sum(local_shapes), 5, device='cuda'))
+    param.is_kda_in_proj = True
+    param.kda_split_shapes = tuple(2 * rows for rows in local_shapes)
+    param.partition_dim = 0
+    grad = torch.arange(param.numel(), dtype=torch.float32, device='cuda').view_as(param)
+
+    output, calls = _record_muon_split_output(
+        param,
+        grad,
+        is_kda_in_proj_fn=lambda p: getattr(p, 'is_kda_in_proj', False),
+    )
+
+    assert [call.shape for call in calls] == [
+        torch.Size([rows, param.size(1)]) for rows in local_shapes
+    ]
+    expected = torch.cat(
+        [torch.full((rows, param.size(1)), i, device='cuda') for i, rows in enumerate(local_shapes, 1)]
+    )
+    assert torch.equal(output, expected)
+
+
+def test_muon_builder_routes_kda_decay_parameters_to_scalar_optimizer(monkeypatch):
+    class _FakeModelChunk:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                num_attention_heads=2,
+                num_query_groups=1,
+                kv_channels=4,
+                multi_latent_attention=False,
+            )
+            self.in_proj = torch.nn.Parameter(torch.ones(8, 4))
+            self.A_log = torch.nn.Parameter(torch.ones(2))
+            self.dt_bias = torch.nn.Parameter(torch.ones(8))
+            self.A_log.is_kda_decay_parameter = True
+            self.dt_bias.is_kda_decay_parameter = True
+
+        def named_parameters(self):
+            return iter(
+                [
+                    ("decoder.layers.0.self_attention.in_proj.weight", self.in_proj),
+                    ("decoder.layers.0.self_attention.A_log", self.A_log),
+                    ("decoder.layers.0.self_attention.dt_bias", self.dt_bias),
+                ]
+            )
+
+    model = _FakeModelChunk()
+    captured = {}
+
+    def fake_get_param_groups(model_chunks, config, config_overrides):
+        del config, config_overrides
+        params = [
+            p
+            for model_chunk in model_chunks
+            for _, p in model_chunk.named_parameters()
+            if p.requires_grad
+        ]
+        return [{"params": params, "is_expert_parallel": False}]
+
+    def fake_tensor_parallel_muon(params, **kwargs):
+        del kwargs
+        captured["muon"] = [p for group in params for p in group["params"]]
+        return SimpleNamespace(param_groups=params, state={})
+
+    def fake_get_megatron_optimizer(config, model_chunks, **kwargs):
+        del kwargs
+        captured["scalar_optimizer"] = config.optimizer
+        captured["scalar"] = [
+            p
+            for model_chunk in model_chunks
+            for _, p in model_chunk.named_parameters()
+            if p.requires_grad
+        ]
+        return SimpleNamespace(chained_optimizers=[])
+
+    monkeypatch.setattr(muon_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(muon_module, "TensorParallelMuon", fake_tensor_parallel_muon)
+    monkeypatch.setattr(muon_module, "FP32Optimizer", lambda optimizer, *args: optimizer)
+    monkeypatch.setattr(muon_module, "get_megatron_optimizer", fake_get_megatron_optimizer)
+    monkeypatch.setattr(
+        muon_module,
+        "ChainedOptimizer",
+        lambda optimizers: SimpleNamespace(chained_optimizers=optimizers),
+    )
+
+    config = OptimizerConfig(optimizer="muon", lr=0.01, min_lr=0.0)
+    config.use_distributed_optimizer = False
+    config.fp16 = False
+    config.bf16 = False
+    muon_module.get_megatron_muon_optimizer(
+        config,
+        [model],
+        config_overrides={},
+        pg_collection=SimpleNamespace(),
+    )
+
+    assert len(captured["muon"]) == 1 and captured["muon"][0] is model.in_proj
+    assert len(captured["scalar"]) == 2
+    assert captured["scalar_optimizer"] == "adam"
+    assert captured["scalar"][0] is model.A_log
+    assert captured["scalar"][1] is model.dt_bias
+
+
 @pytest.mark.parametrize(
     ("split_mla_per_head", "expected_q_up_proj_head_dim"),
     [(False, None), (True, 8)],
@@ -677,12 +793,19 @@ def test_muon_builder_uses_per_head_mla_kv_split_shapes(
                 v_head_dim=5,
                 qk_pos_emb_head_dim=2,
                 q_lora_rank=None,
+                gated_linear_unit=True,
             )
             self.kv_up = torch.nn.Parameter(torch.ones(88, 5))
+            self.grouped_fc1 = torch.nn.Parameter(torch.ones(8, 5))
+            self.offloaded_fc1 = torch.nn.Parameter(torch.ones(5, 8))
 
         def named_parameters(self):
             return iter(
-                [("decoder.layers.0.self_attention.linear_kv_up_proj.weight", self.kv_up)]
+                [
+                    ("decoder.layers.0.self_attention.linear_kv_up_proj.weight", self.kv_up),
+                    ("decoder.layers.0.mlp.experts.linear_fc1.weight0", self.grouped_fc1),
+                    ("decoder.layers.0.mlp.experts.weight1_expert_0", self.offloaded_fc1),
+                ]
             )
 
     captured_kwargs = {}
@@ -721,14 +844,17 @@ def test_muon_builder_uses_per_head_mla_kv_split_shapes(
     config.fp16 = False
     config.bf16 = False
 
+    model_chunk = _FakeModelChunk()
     muon_module.get_megatron_muon_optimizer(
         config,
-        [_FakeModelChunk()],
+        [model_chunk],
         pg_collection=SimpleNamespace(),
     )
 
     assert captured_kwargs["kv_up_proj_split_shapes"] == (6, 5)
     assert captured_kwargs["q_up_proj_head_dim"] == expected_q_up_proj_head_dim
+    assert model_chunk.grouped_fc1.glu_split_dim == 0
+    assert not hasattr(model_chunk.offloaded_fc1, "glu_split_dim")
 
 
 def test_muon_optimizer_mla_kv_up_proj_split():

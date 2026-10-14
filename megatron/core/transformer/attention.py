@@ -331,6 +331,10 @@ class Attention(MegatronModule, ABC):
             and "core_attn" in self.config.recompute_modules
         )
 
+        # Enabled by SelfAttention only; cross-attention keeps its qkv tensors materialized.
+        self.recompute_qkv = False
+        self.qkv_checkpoint = None
+
         self.offload_qkv_linear = (
             self.config.fine_grained_activation_offloading
             and "qkv_linear" in self.config.offload_modules
@@ -418,6 +422,71 @@ class Attention(MegatronModule, ABC):
         )
 
         return hidden_states
+
+    def _qkv_and_rope(self, hidden_states, key_value_states, rotary_pos_emb, packed_seq_params):
+        """Produce the query/key/value tensors (and output gate, if enabled) consumed by the
+        attention kernel.
+
+        Function wrapper for: QKV projection, the QK layernorms and the RoPE application
+        Used as the recompute region for `recompute_modules=["qkv"]`.
+        """
+        qkv_output = self.get_query_key_value_tensors(
+            hidden_states,
+            key_value_states,
+            split_qkv=True,
+            output_gate=self.config.attention_output_gate,
+        )
+        if self.config.attention_output_gate:
+            query, key, value, gate = qkv_output
+        else:
+            query, key, value = qkv_output
+
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if is_thd:
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+
+            if is_thd:
+                cu_seqlens_q = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                )
+                cu_seqlens_kv = (
+                    packed_seq_params.cu_seqlens_kv_padded
+                    if packed_seq_params.cu_seqlens_kv_padded is not None
+                    else packed_seq_params.cu_seqlens_kv
+                )
+            else:
+                cu_seqlens_q = cu_seqlens_kv = None
+
+            mscale = _yarn_get_concentration_factor_from_config(self.config)
+            if q_pos_emb is not None:
+                query = apply_rotary_pos_emb(
+                    query,
+                    q_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_q,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                )
+            if k_pos_emb is not None:
+                key = apply_rotary_pos_emb(
+                    key,
+                    k_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                )
+
+        if self.config.attention_output_gate:
+            return query, key, value, gate
+        return query, key, value
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -1048,6 +1117,42 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
+        recompute_qkv = (
+            self.recompute_qkv
+            and self.training
+            and inference_context is None
+            and split_qkv
+        )
+
+        if recompute_qkv:
+            self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                fp8=self.config.fp8 or self.config.fp4
+            )
+            qkv_output = self.qkv_checkpoint.checkpoint(
+                lambda hs: self._qkv_and_rope(
+                    hs, key_value_states, rotary_pos_emb, packed_seq_params
+                ),
+                hidden_states,
+            )
+            gate = None
+            if self.config.attention_output_gate:
+                query, key, value, gate = qkv_output
+            else:
+                query, key, value = qkv_output
+            nvtx_range_pop(suffix="qkv")
+            return self._core_attn_and_output_proj(
+                query,
+                key,
+                value,
+                attention_mask,
+                self.attn_mask_type,
+                attention_bias,
+                packed_seq_params,
+                inference_context,
+                block_table=None,
+                gate=gate,
+            )
+
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
@@ -1197,6 +1302,33 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        return self._core_attn_and_output_proj(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias,
+            packed_seq_params,
+            inference_context,
+            block_table,
+            gate,
+        )
+
+    def _core_attn_and_output_proj(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type,
+        attention_bias,
+        packed_seq_params,
+        inference_context,
+        block_table,
+        gate,
+    ):
+        """Run core attention on the prepared q/k/v and apply the output projection."""
         # ==================================
         # core attention computation
         # ==================================
@@ -1271,6 +1403,11 @@ class Attention(MegatronModule, ABC):
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
+        # release after output gate
+        if self.qkv_checkpoint is not None:
+            self.qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
+            self.qkv_checkpoint = None
+
         # =================
         # Output. [sq, b, h]
         # =================
@@ -1332,6 +1469,11 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+        )
+
+        self.recompute_qkv = (
+            self.config.recompute_granularity == 'selective'
+            and "qkv" in self.config.recompute_modules
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size

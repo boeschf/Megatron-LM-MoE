@@ -66,7 +66,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, dispatch, moe, combine, post_process = callables
+    attn, dispatch, moe, combine, post_combine, post_process = callables
     assert post_process is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
@@ -78,16 +78,19 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         node.chunk_state.model = dummy_model
 
         # attn fwd
-        local_tokens, probs = attn(node, input_tensors[i])
+        local_tokens, local_tokens_sf, probs = attn(node, input_tensors[i])
 
         # dispatch fwd
-        dispatched_tokens = dispatch(node, local_tokens, probs)
+        dispatched_tokens, dispatched_tokens_sf = dispatch(
+            node, local_tokens, local_tokens_sf, probs
+        )
 
         # moe fwd
-        expert_output = moe(node, dispatched_tokens)
+        expert_output = moe(node, dispatched_tokens, dispatched_tokens_sf)
 
-        # combine fwd
-        hidden_states = combine(node, expert_output)
+        # combine and post-combine fwd
+        combined_output = combine(node, expert_output)
+        hidden_states = post_combine(node, combined_output)
 
         # loss
         output_tensors.append(hidden_states)
@@ -118,7 +121,10 @@ class TestTransformerLayerSubmoduleCallables:
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("grouped_gemm", [True, False])
     @pytest.mark.parametrize("permute_fusion", [True, False])
-    def test_1f1b_overlap(self, dispatcher_type, grouped_gemm, permute_fusion):
+    @pytest.mark.parametrize("sandwich_norm", [False, True])
+    def test_1f1b_overlap(
+        self, dispatcher_type, grouped_gemm, permute_fusion, sandwich_norm
+    ):
         """
         Tests the 1-forward-1-backward overlap optimization.
 
@@ -135,6 +141,7 @@ class TestTransformerLayerSubmoduleCallables:
         extra_kwargs = {
             "moe_token_dispatcher_type": dispatcher_type,
             "moe_permute_fusion": permute_fusion,
+            "sandwich_norm": sandwich_norm,
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"

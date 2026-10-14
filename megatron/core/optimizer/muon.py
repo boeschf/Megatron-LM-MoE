@@ -3,7 +3,7 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from typing import Any, Callable, Dict, List, Literal, Optional, get_args
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -15,6 +15,7 @@ from megatron.core.utils import get_pg_size, log_single_rank
 
 from . import HAVE_EMERGING_OPTIMIZERS, HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
+from .muon_logging import _gain_log_family
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -73,8 +74,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_fc1: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
+        qkv_split_shapes: Sequence[int] | None = None,
+        is_kda_in_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         is_kv_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         kv_up_proj_split_shapes: tuple[int, int] | None = None,
         is_qkv_down_proj_fn: Callable[[torch.Tensor], bool] | None = None,
@@ -123,8 +126,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.pg_collection = pg_collection
         self.mode = mode
         self.split_qkv = split_qkv
+        self.split_fc1 = split_fc1
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self.is_kda_in_proj_fn = is_kda_in_proj_fn
         self.is_kv_up_proj_fn = is_kv_up_proj_fn
         self.kv_up_proj_split_shapes = kv_up_proj_split_shapes
         self.is_qkv_down_proj_fn = is_qkv_down_proj_fn
@@ -210,6 +215,37 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+        elif self.split_fc1 and (glu_split_dim := getattr(p, 'glu_split_dim', None)) is not None:
+            if grad.size(glu_split_dim) % 2 != 0:
+                raise ValueError(
+                    f"Fused GLU FC1 dimension {glu_split_dim} must be even, "
+                    f"got shape {tuple(grad.shape)}"
+                )
+            fc1_grads = torch.chunk(grad, 2, dim=glu_split_dim)
+            fc1_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in fc1_grads
+            ]
+            grad = torch.cat(fc1_grads, dim=glu_split_dim)
+        elif (
+            self.split_qkv
+            and self.is_kda_in_proj_fn is not None
+            and self.is_kda_in_proj_fn(p)
+        ):
+            split_shapes = getattr(p, "kda_split_shapes", None)
+            if split_shapes is None:
+                raise ValueError("KDA in_proj is missing kda_split_shapes metadata")
+            split_shapes = self._local_dim0_split_shapes(
+                p, grad, split_shapes, allow_groups=False
+            )
+            if sum(split_shapes) != grad.size(0):
+                raise ValueError(
+                    f"KDA split shapes {split_shapes} do not match gradient shape {grad.shape}"
+                )
+            kda_grads = torch.split(grad, split_shapes, dim=0)
+            kda_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in kda_grads
+            ]
+            grad = torch.cat(kda_grads, dim=0)
         elif (
             self.split_qkv
             and self.is_qkv_down_proj_fn is not None
@@ -328,12 +364,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_size = total // dim0
         if tp_size <= 1:
             raise ValueError(
-                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"Cannot infer local split shapes for dim0-sharded projection parameter with "
                 f"tensor dim0 {dim0} and global split shapes {shapes}"
             )
         if any(shape % tp_size != 0 for shape in shapes):
             raise ValueError(
-                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"Cannot split dim0-sharded projection parameter with global split shapes {shapes} "
                 f"over TP size {tp_size}"
             )
 
@@ -432,11 +468,15 @@ def get_megatron_muon_optimizer(
         num_attention_heads = model_chunk.config.num_attention_heads
         num_query_groups = model_chunk.config.num_query_groups
         kv_channels = model_chunk.config.kv_channels
-        qkv_split_shapes = [
-            num_attention_heads // num_query_groups * kv_channels,
-            kv_channels,
-            kv_channels,
-        ]
+        q_group_dim = num_attention_heads // num_query_groups * kv_channels
+        if getattr(model_chunk.config, 'attention_output_gate', False):
+            # --attention-output-gate fuses a Q-sized gate block into linear_qkv,
+            # making the per-group layout [Q, Gate, K, V] (see GQA
+            # get_query_key_value_tensors). Split on all 4 blocks or the reshape
+            # in the qkv-split path mismatches. (Mutually exclusive with MLA.)
+            qkv_split_shapes = [q_group_dim, q_group_dim, kv_channels, kv_channels]
+        else:
+            qkv_split_shapes = [q_group_dim, kv_channels, kv_channels]
         mla_config = model_chunk.config
         is_mla = getattr(mla_config, 'multi_latent_attention', False)
         if is_mla:
@@ -457,6 +497,7 @@ def get_megatron_muon_optimizer(
             mla_config.kv_lora_rank + mla_config.qk_pos_emb_head_dim,
         ) if is_mla and getattr(mla_config, 'q_lora_rank', None) is not None else None
 
+        named_modules = dict(model_chunk.named_modules())
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -468,16 +509,40 @@ def get_megatron_muon_optimizer(
             # add flags for grouped QKV and MLA projection parameters
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
+            if (
+                getattr(model_chunk.config, 'gated_linear_unit', False)
+                and param.ndim == 2
+                and 'linear_fc1.weight' in name
+            ):
+                param.glu_split_dim = 0
             if 'linear_kv_up_proj.weight' in name and len(param.shape) == 2:
                 param.is_kv_up_proj = True
             if 'linear_q_up_proj.weight' in name and len(param.shape) == 2:
                 param.is_q_up_proj = True
             if 'linear_qkv_down_proj.weight' in name and len(param.shape) == 2:
                 param.is_qkv_down_proj = True
+            if len(param.shape) == 2 and name.endswith('router.weight'):
+                param.is_router = True
+            if len(param.shape) == 2 and ('linear_fc2' in name or 'linear_proj' in name):
+                param.is_out_proj = True
+            param.md_gain_log_family = _gain_log_family(name, param)
+            if param.md_gain_log_family == "layernorm":
+                param.md_layernorm_gain_offset = float(
+                    getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
+                )
+            module_name = name.rpartition('.')[0]
+            while module_name:
+                module = named_modules.get(module_name)
+                layer_number = getattr(module, 'layer_number', None)
+                if layer_number is not None:
+                    param.md_gain_log_layer = int(layer_number) - 1
+                    break
+                module_name = module_name.rpartition('.')[0]
             # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
             if (
                 not getattr(param, 'is_embedding_or_output_parameter', False)
                 and len(param.shape) == 2
+                and not getattr(param, 'is_kda_decay_parameter', False)
             ):
                 linear_params.append(param)
             else:
@@ -498,8 +563,10 @@ def get_megatron_muon_optimizer(
         "num_ns_steps": config.muon_num_ns_steps,
         "scale_mode": config.muon_scale_mode,
         "split_qkv": config.muon_split_qkv,
+        "split_fc1": config.muon_split_fc1,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
         "qkv_split_shapes": qkv_split_shapes,
+        "is_kda_in_proj_fn": lambda p: getattr(p, "is_kda_in_proj", False),
         "is_kv_up_proj_fn": lambda p: getattr(p, "is_kv_up_proj", False),
         "kv_up_proj_split_shapes": kv_up_proj_split_shapes,
         "is_qkv_down_proj_fn": lambda p: getattr(p, "is_qkv_down_proj", False),

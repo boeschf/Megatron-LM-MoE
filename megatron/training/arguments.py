@@ -1043,7 +1043,7 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    # args.variable_seq_lengths = False
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
@@ -1115,6 +1115,39 @@ def validate_args(args, defaults={}):
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
+
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        # The dataset omits attention_mask when inter-document masking is
+        # enabled; disable the flag to avoid a TP broadcast mismatch.
+        if args.create_attention_mask_in_dataloader:
+            args.create_attention_mask_in_dataloader = False
+        assert not args.sft, (
+            '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
+            'SFT packing already restricts attention to each packed sequence.'
+        )
+        assert args.context_parallel_size == 1, (
+            '--dataloader-inter-document-masking does not support context parallelism '
+            'yet: document boundaries are not guaranteed to be divisible by '
+            '2 * context-parallel-size, which the THD CP partitioning requires.'
+        )
+        assert not args.hybrid_context_parallel, (
+            '--dataloader-inter-document-masking does not support hybrid context '
+            'parallelism yet.'
+        )
+
+    # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
+    # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
+    if args.attention_backend == AttnBackend.auto and (
+        args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    ):
+        args.attention_backend = AttnBackend.flash
+        if args.rank == 0:
+            print(
+                '> packed-sequence attention: selecting the flash attention backend '
+                '(cuDNN fused attention is much slower on THD-format batches). '
+                'Pass --attention-backend to override.',
+                flush=True,
+            )
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -1367,6 +1400,16 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k >= 2, \
+            f"--goldfish-k (drop frequency 1/k) must be >= 2; k=1 drops ~100%. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, \
+            f"--goldfish-h (context width) must be a positive integer. ({args.goldfish_h})"
+        if args.seq_length is not None:
+            assert args.goldfish_h < args.seq_length, \
+                f"--goldfish-h ({args.goldfish_h}) must be < --seq-length ({args.seq_length})."
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -1487,6 +1530,13 @@ def validate_args(args, defaults={}):
         assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
         assert args.bf16, "MoE expert offloading currently requires using bfloat16 precision."
         assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
+        if args.optimizer == 'muon':
+            warn_rank_0(
+                'MoE expert offloading is not currently correctly supported by the standalone '
+                'Muon optimizer: regular offloaded expert weights are orthogonalized in their '
+                'transposed fused shape without splitting gate/up, while merged FP8 expert '
+                'weights do not undergo Muon orthogonalization.'
+            )
 
         if args.overlap_grad_reduce:
             args.moe_offloading_experts_skip_post_backward_hook = True
@@ -1565,14 +1615,59 @@ def validate_args(args, defaults={}):
                 "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
                 "softplus gains are positive, so the clamp only changes values below 1e-8."
             )
-        if args.hypersphere_radius_from_init:
+        if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
-                "--hypersphere-radius-from-init only applies to --hypersphere-mode flat; "
+                "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
                 f"got {args.hypersphere_mode}."
             )
             warn_rank_0(
-                "--hypersphere-radius-from-init assumes matrix init_std is 1/sqrt(hidden); "
+                "--hypersphere-radius-mode init assumes matrix init_std is 1/sqrt(hidden); "
                 "set --init-method-std accordingly."
+            )
+            if args.muon_tp_mode == "blockwise":
+                warn_rank_0(
+                    "--hypersphere-radius-mode init with --muon-tp-mode blockwise scales the Muon "
+                    "update from local shard shapes while the weight is projected with global "
+                    "shapes; the two spheres disagree under TP > 1."
+                )
+        elif args.hypersphere_radius_mode == "fan_in":
+            sphere_modes = {
+                "--hypersphere-mode": args.hypersphere_mode,
+                "--hypersphere-embedding-mode": args.hypersphere_embedding_mode,
+                "--hypersphere-router-mode": args.hypersphere_router_mode,
+            }
+            active = {k: v for k, v in sphere_modes.items() if v not in (None, "none")}
+            assert active, (
+                "--hypersphere-radius-mode fan_in only moves the sphere radius, so it needs at "
+                "least one active hypersphere mode."
+            )
+            if not args.md_normalize_update_to_weight_norm:
+                unsupported = {k: v for k, v in active.items() if v not in ("row", "flat")}
+                assert not unsupported, (
+                    "--hypersphere-radius-mode fan_in puts ||W||_F at sqrt(d_out), which the "
+                    "'row' (unit rows) and 'flat' modes reach but the column-normalizing modes "
+                    f"do not; got {unsupported}."
+                )
+                if args.num_experts is not None:
+                    assert args.num_experts <= args.hidden_size, (
+                        "--hypersphere-radius-mode fan_in keeps the router's Muon scale "
+                        "unmodified, which matches the sqrt(num_experts) router sphere only when "
+                        f"num_experts <= hidden_size; got {args.num_experts=} and "
+                        f"{args.hidden_size=}."
+                    )
+                assert args.muon_scale_mode == "shape_up", (
+                    "--hypersphere-radius-mode fan_in targets ||update||_F = sqrt(d_out), which "
+                    f"only agrees with --muon-scale-mode shape_up; got {args.muon_scale_mode}."
+                )
+                assert args.muon_tp_mode != "blockwise", (
+                    "--hypersphere-radius-mode fan_in is inconsistent with --muon-tp-mode "
+                    "blockwise (the update would be scaled from local shard shapes while the "
+                    "weight is projected with global shapes); use duplicated or distributed."
+                )
+            warn_rank_0(
+                "--hypersphere-radius-mode fan_in assumes matrix init_std is 1/sqrt(fan_in); set "
+                "the init accordingly, or the first projection will rescale blocks whose d_in "
+                "differs from the init denominator."
             )
         assert not (args.hypersphere_scale_out_proj_init and args.residual_output_scaling), (
             "--hypersphere-scale-out-proj-init and --residual-output-scaling both apply the "
@@ -1613,6 +1708,15 @@ def validate_args(args, defaults={}):
                 and not args.moe_shared_expert_overlap
             )
             if wgrad_in_graph_scope:
+                assert args.cuda_graph_impl == 'none' or args.pipeline_model_parallel_size > 1, (
+                    'CUDA graph with delay_wgrad_compute is not supported at '
+                    'pipeline-model-parallel-size 1. On graph replay the delayed wgrad of the '
+                    'modules inside the graph scope (shared experts / fc1_latent_proj) is done '
+                    'by replaying the captured wgrad graph, which never runs the Python '
+                    'grad-ready hooks, so DDP never issues the grad reduce for those params and '
+                    'finish_grad_sync() asserts on the first replayed iteration. Use '
+                    '--pipeline-model-parallel-size > 1, or disable CUDA graphs.'
+                )
                 assert is_te_min_version(
                     "2.12.0"
                 ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
@@ -1667,6 +1771,17 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
+            if getattr(args, 'pretraining_packing_strategy', None) == 'bfd':
+                # Capture takes a routing padding_mask only for MoE layers that have already
+                # routed with one, which needs at least one real forward before the graphs
+                # are recorded. With no warmup step the graphs are captured unmasked and TE
+                # silently ignores the mask passed at replay, so fail here instead.
+                assert args.cuda_graph_warmup_steps > 0, (
+                    "--cuda-graph-warmup-steps must be > 0 with --pretraining-packing-strategy "
+                    "bfd and --cuda-graph-impl transformer_engine: with 0 the CUDA graphs are "
+                    "captured before any forward and the MoE routing padding mask is silently "
+                    "dropped from every replay."
+                )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
@@ -2594,6 +2709,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-no-split-fc1', action='store_false', default=True,
+                       dest='muon_split_fc1',
+                       help='Whether to split fused GLU FC1 parameters into gate/up matrices '
+                       'for Muon or MDDecoupling')
     group.add_argument('--muon-split-mla-per-head', action='store_true',
                        help='Split MLA up-projection parameters per attention head for Muon or '
                        'MDDecoupling.')
@@ -2621,9 +2740,12 @@ def _add_regularization_args(parser):
                        'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
-    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+    group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed'],
-                       help='How to perform NS calculation for tensor model parallel weights')
+                       help='How to perform NS calculation for tensor model parallel weights. '
+                       'Defaults to "duplicated" (orthogonalize the full TP-unsharded matrix); '
+                       '"blockwise" treats each shard as its own matrix and is rejected with '
+                       '--hypersphere-radius-mode fan_in.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
@@ -2863,6 +2985,14 @@ def _add_training_args(parser):
                        help='Absolute LR for matrix (2D non-embedding/output) params under '
                        '--optimizer md_decoupling or muon/dist_muon (the Muon-managed matrices; '
                        'the scalar Adam/Lion group stays on --lr). Overrides muon_lr_factor * lr.')
+    group.add_argument('--router-lr', type=float, default=None,
+                       help='Absolute LR for MoE router weights under md_decoupling, on either '
+                       'the Muon or the Adam branch. When unset, Muon-branch routers use '
+                       '--matrix-lr and Adam-branch routers use the base --lr.')
+    group.add_argument('--router-weight-decay', type=float, default=None,
+                       help='Decoupled weight decay for MoE router weights under md_decoupling, '
+                       'independent of --weight-decay. Requires --hypersphere-router-mode none '
+                       '(the hypersphere projection would undo it).')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '
@@ -2903,11 +3033,18 @@ def _add_training_args(parser):
                        help='Scale the hypersphere target radius for is_out_proj params '
                        '(linear_proj, linear_fc2) by 1/sqrt(2 * num_layers), matching '
                        'scaled_init_method_normal.')
-    group.add_argument('--hypersphere-radius-from-init', action='store_true', default=False,
-                       help='Place each flat-mode matrix sphere at its init Frobenius norm '
-                       '(init_std=1/sqrt(hidden)) instead of sqrt(max(d_out,d_in)), rescaling both '
-                       'the projection target and the Muon update by sqrt(min(d_out,d_in)/hidden). '
-                       'Keeps narrow matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere.')
+    group.add_argument('--hypersphere-radius-mode', type=str, default='shape_native',
+                       choices=['shape_native', 'init', 'fan_in'],
+                       help='Where to place the hypersphere, relative to the shape-native radius '
+                       '(unit row/col slices, sqrt(max(d_out,d_in)) for flat). "init" places each '
+                       'flat-mode sphere at the matrix init Frobenius norm '
+                       '(init_std=1/sqrt(hidden)), rescaling both the projection target and the '
+                       'Muon update by sqrt(min(d_out,d_in)/hidden), which keeps narrow matrices '
+                       '(MLA lora, MoE fc2, GQA K/V) on their init sphere. "fan_in" instead '
+                       'assumes init_std=1/sqrt(d_in), giving ||W||_F = sqrt(d_out) (unit rows) '
+                       'for any shape under both --hypersphere-mode row and flat, with the Muon '
+                       'update rescaled to the same norm; it is independent of hidden size, so it '
+                       'also holds for blocks whose axes are both off the residual stream.')
     group.add_argument('--md-router-use-orthogonal-updates',
                        type=lambda s: {'true': True, 'false': False}[s.lower()],
                        default=None, choices=[True, False],
@@ -2947,6 +3084,11 @@ def _add_training_args(parser):
                        help='Use Muon-style orthogonalized updates for matrix params under '
                        'md_decoupling. Use --no-use-orthogonal-updates to disable. '
                        'Embedding + LM head ALWAYS use the Adam branch.')
+    group.add_argument('--md-normalize-update-to-weight-norm', action='store_true',
+                       help='For each existing logical MuonMD block, rescale U to '
+                       'U / ||U||_F * R_W using the measured update norm rather than the ideal '
+                       'semi-orthogonal norm. Each weight-block norm R_W is cached once. This '
+                       'supersedes --muon-scale-mode and other scalar update scaling.')
     group.add_argument('--use-layer-wise-distributed-optimizer', action='store_true', default=False,
                        help='For --optimizer md_decoupling: wrap the optimizer with '
                        'LayerWiseDistributedOptimizer to shard optimizer state over the '
@@ -3067,6 +3209,16 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-staging', type=str, default='pinned',
+                       choices=['pinned', 'pageable', 'streamed'],
+                       help='How torch_dist saves stage GPU shards to the host. "pinned": '
+                       'all tensors are copied into pinned host memory first (torch rounds '
+                       'every block up to a power of two, so the peak is up to 2x the shard). '
+                       '"pageable": all tensors are copied into ordinary host memory first '
+                       '(peak = shard size, freed after the write). "streamed": tensors are '
+                       'copied one at a time right before they are written (peak = largest '
+                       'tensor); synchronous saves only, falls back to pageable with '
+                       '--async-save.')
     group.add_argument('--save-iters', type=str, default=None,
                        help='Comma-separated list of iterations at which to save a '
                        'checkpoint, in addition to --save-interval. Unlike '
@@ -3374,8 +3526,17 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--variable-seq-lengths', action='store_true',
+                       help='Compute the length of the tensor you send in PP groups.'
+                       'Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--mask-loss-token-ids', type=int, nargs='+', default=None,
+                       help='Token IDs whose next-token losses are masked during pretraining.')
+    group.add_argument('--dataloader-inter-document-masking', action='store_true',
+                       help='Return cu_seqlens marking document boundaries '
+                       'within each sample so that attention is restricted '
+                       'to individual documents.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
@@ -3428,6 +3589,16 @@ def _add_data_args(parser):
                             'efficiency and don\'t cut the samples if < sequence_length.')
     group.add_argument('--max-docs-per-bin', type=int, default=0,
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable Goldfish loss during pretraining: deterministically drop '
+                            '~1/k of tokens from the loss to mitigate verbatim memorization. '
+                            'Train split only. Special tokens declared by the (HuggingFace-backed) '
+                            'tokenizer are never dropped. Supported by pretrain_gpt.py only.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Goldfish drop factor k; drop probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,
+                       help='Goldfish context width: the h labels ending at (and including) '
+                            'a position are hashed to decide its drop.')
     return parser
 
 

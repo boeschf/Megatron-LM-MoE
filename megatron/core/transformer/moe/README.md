@@ -297,8 +297,25 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **seq_aux_loss** | Sequence-level auxiliary loss for balancing expert usage on each sequence| `--moe-router-load-balancing-type seq_aux_loss` |
 | **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
 | **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
+| **quantile_balancing** | Per-expert bias from a legacy quantile average or a histogram approximation to the pooled global-batch quantile | `--moe-router-load-balancing-type quantile_balancing --moe-router-quantile-balancing-method histogram` |
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
 | **none** | No load balancing | `--moe-router-load-balancing-type none` |
+
+Histogram quantile balancing accumulates local per-expert counts across microbatches without
+forward-pass communication. At the global-batch boundary, one TP+DP+CP all-reduce pools the
+histograms before the bias is decoded, mean-centered, and applied to the next batch. The legacy
+`average` method remains available for comparison, but averaging independently computed quantiles
+generally differs from the true pooled quantile. This implementation follows the
+[Kimi K3 Technical Report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf).
+
+Global-batch expert-load violation is always logged. Optional scopes selected with
+`--moe-router-violation-metrics` retain local expert counts and batch their communication at the
+global-batch boundary. By default, `mbs` logs `expert_*` after pooling each microbatch across TP+CP.
+`seq` logs `seq_expert_*` over the same TP+CP domain, and `ep` additionally pools each microbatch
+across EP before logging `ep_expert_*`. Each scope reports maximum, minimum, median, and population
+standard deviation of normalized load violation, plus normalized expert-load entropy. These
+statistics are computed only after the count reductions, avoiding nonlinear averages of rank-local
+values.
 
 ### Token Dispatching
 
@@ -521,7 +538,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Router Arguments
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-router-load-balancing-type | Load balancing: aux_loss, sinkhorn, seq_aux_loss, none | aux_loss |
+| --moe-router-load-balancing-type | Load balancing: aux_loss, sinkhorn, seq_aux_loss, quantile_balancing, none | aux_loss |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |
 | --moe-router-pre-softmax | Softmax before top-k | False |
@@ -529,8 +546,10 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-group-topk | Selected groups in group-limited routing | None |
 | --moe-router-enable-expert-bias | Dynamic per-expert bias | False |
 | --moe-router-bias-update-rate | Bias update rate | 1e-3 |
+| --moe-router-quantile-balancing-method | QB estimator: average, legacy_average (raw-logit compatibility), or histogram | histogram |
+| --moe-router-quantile-balancing-num-bins | Per-expert histogram bins for histogram QB | 1000 |
 | --moe-router-bias-metrics | Log router bias mean, standard deviation, minimum, and maximum | False |
-| --moe-router-ep-violation-metrics | Log expert-load violation over EP times MBS | False |
+| --moe-router-violation-metrics | Optional violation scopes: mbs, seq, ep; global is always logged | [mbs] |
 | --moe-router-fusion | Enable router fusion | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |

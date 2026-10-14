@@ -28,7 +28,9 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
-from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
+from megatron.core.transformer.moe.moe_offload import (
+    MoEReloadTrigger,
+)
 
 
 def weak_method(method):
@@ -522,6 +524,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 rotary_pos_sin: Optional[Tensor] = None,
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
+                padding_mask: Optional[Tensor] = None,
             ):
                 hidden_states, _ = layer._forward_attention(
                     hidden_states=hidden_states,
@@ -551,7 +554,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         )
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
@@ -566,6 +569,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             rotary_pos_sin=node.chunk_state.rotary_pos_sin,
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
+            padding_mask=node.chunk_state.padding_mask,
         )
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
@@ -595,6 +599,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
+        # coarse-grained expert weights reload
+        layer.mlp._preload_expert_weights()
         dispatched_tokens, dispatched_tokens_sf, dispatched_probs = layer.mlp.dispatch(
             local_tokens, local_tokens_sf, probs
         )
@@ -648,7 +654,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.act_offload_handle = getattr(
             layer.mlp.experts, "_act_offload_handle", None
         )
-
+        node.layer_state.mgrad_offload_handle = getattr(
+            layer.mlp.experts, "_main_grad_offload_handle", None
+        )
+        node.layer_state.param_offload_handle = getattr(
+            layer.mlp.experts, "_param_offload_handle", None
+        )
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
         # `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep:
@@ -676,7 +687,13 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # all-to-all window. No-op unless moe_offload_activations produced an active handle.
         handle = getattr(node.layer_state, "act_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
-            output = MoEActReloadTrigger.apply(output, handle)
+            output = MoEReloadTrigger.apply(output, handle)
+        mgrad_handle = getattr(node.layer_state, "mgrad_offload_handle", None)
+        if mgrad_handle is not None and getattr(mgrad_handle, "active", False):
+            output = MoEReloadTrigger.apply(output, mgrad_handle)
+        param_handle = getattr(node.layer_state, "param_offload_handle", None)
+        if param_handle is not None and getattr(param_handle, "active", False):
+            output = MoEReloadTrigger.apply(output, param_handle)
         return output
 
         residual = node.layer_state.residual
@@ -719,6 +736,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = layer.mlp.postprocess(output, shared_expert_output)
 
         mlp_output_with_bias = (output, None)
+        # Keep the fine-grained MoE path equivalent to TransformerLayer._forward_post_mlp:
+        # apply the optional post norm (and residual scaling) before bias-dropout-add.
+        if not layer.keel:
+            mlp_output_with_bias = layer._apply_post_norm(
+                mlp_output_with_bias, layer.post_mlp_layernorm
+            )
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
         # beverin-rocm (T3): apply the sandwich norm / residual output scale / KEEL exactly as

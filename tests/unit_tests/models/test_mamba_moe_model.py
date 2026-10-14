@@ -173,7 +173,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_bias_update_rate": 0.001,
     "moe_router_dtype": "fp64",
     "moe_router_enable_expert_bias": True,
-    "moe_router_ep_violation_metrics": False,
+    "moe_router_violation_metrics": ["mbs"],
     "moe_router_force_load_balancing": False,
     "moe_router_fusion": False,
     "moe_router_group_topk": None,
