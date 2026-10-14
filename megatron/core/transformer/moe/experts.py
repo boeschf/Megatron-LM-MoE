@@ -598,7 +598,9 @@ class TEGroupedMLP(MegatronModule):
         """
         _turbo = _beverin_turbo.ENABLED and not (self.config.fp8 or self.config.fp4)
         if _turbo:
-            group_lens = tokens_per_expert.to(
+            # beverin-rocm (lab T6 t6-0005): BEVERIN_T6_DEVTPE=1 hands over a device copy of the counts (no blocking H2D)
+            _dev = getattr(tokens_per_expert, "_beverin_dev", None)
+            group_lens = _dev if _dev is not None else tokens_per_expert.to(
                 device=permuted_local_hidden_states.device, dtype=torch.int64
             )
         tokens_per_expert: list[int] = tokens_per_expert.tolist()

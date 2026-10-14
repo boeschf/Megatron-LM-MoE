@@ -18,6 +18,9 @@ import torch.distributed as dist
 
 _FP8 = os.environ.get("BEVERIN_T6_FP8", "0") == "1"
 _TIMING = os.environ.get("BEVERIN_T6_TIMING", "0") == "1"
+# BEVERIN_T6_DEVTPE=1 (T6 t6-0005, ported by A4): hand the experts a device copy of tokens-per-expert (from the plan's
+# all-gather, already on the device), so the turbo expert MLP does no blocking H2D copy (forward and expert recompute).
+_DEVTPE = os.environ.get("BEVERIN_T6_DEVTPE", "0") == "1"
 _QB = 128  # fp8 block: columns per scale
 TIMES = {}
 
@@ -275,12 +278,17 @@ class HierEP:
             in2 = [int(sum(Cg[s, mine[j]] for s in rail)) for j in range(G)]
             out2 = [int(sum(Cg[m * G + j, self.me] for m in range(NN))) for j in range(G)]
             tpe = Ce[:, self.me * NLE:(self.me + 1) * NLE].sum(0)
-            return dict(idx=idx, need_node=need_node, in1=in1, out1=out1, in2=in2, out2=out2, tpe=tpe, T=T)
+            tpe_dev = allv[:, NN + E + self.me * NLE:NN + E + (self.me + 1) * NLE].sum(0) if _DEVTPE else None
+            return dict(idx=idx, need_node=need_node, in1=in1, out1=out1, in2=in2, out2=out2, tpe=tpe, tpe_dev=tpe_dev,
+                        T=T)
 
     def dispatch(self, x, probs, pl):
         with _tm("d_total"):
             x3, p3 = _Dispatch.apply(x, probs, self, pl)
-        return x3, p3, pl["tpe"].clone()
+        tpe = pl["tpe"].clone()
+        if pl.get("tpe_dev") is not None:
+            tpe._beverin_dev = pl["tpe_dev"]
+        return x3, p3, tpe
 
     def combine(self, y3, pl):
         with _tm("c_total"):
