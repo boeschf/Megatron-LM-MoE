@@ -151,6 +151,7 @@ class _TurboExpertLinear(torch.autograd.Function):
         return (grad_x, None, None, *grad_w.unbind(0))
 
 
+@torch.no_grad()
 def _delayed_wgrad(x, grad_out, wl, group_lens, offs, weights, fuse=True):
     """Expert wgrad for TE GroupedLinear.backward_dw (lab T3): accumulate into main_grad when it exists (TE's
     wgrad accumulation fusion), else leave the per-expert wgrads in `wl` for TE to assign to .grad."""
