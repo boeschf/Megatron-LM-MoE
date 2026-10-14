@@ -20,8 +20,16 @@ class BeverinT6AlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         assert not config.moe_router_padding_for_quantization
         assert getattr(self, "shared_experts", None) is None
         hidden = config.moe_latent_size or config.hidden_size
-        self.hier = _t6.HierEP(self.ep_group, self.num_experts, config.moe_router_topk, hidden,
-                               gpn=int(os.environ.get("BEVERIN_T6_GPN", 4)))
+        if os.environ.get("BEVERIN_A3_T7", "0") == "1":
+            # lab2 A3 (a3-0002): same rail all-to-all, intra-node stage as Triton push/pull over symmetric memory
+            # (no RCCL node all-to-all, so a global RCCL channel cap does not slow it); fp8 as BEVERIN_T6_FP8
+            from megatron.core.transformer.moe import beverin_a3_t7 as _a7
+            self.hier = _a7.T7EP(self.ep_group, self.num_experts, config.moe_router_topk, hidden,
+                                 gpn=int(os.environ.get("BEVERIN_T6_GPN", 4)),
+                                 fp8=os.environ.get("BEVERIN_T6_FP8", "0") == "1")
+        else:
+            self.hier = _t6.HierEP(self.ep_group, self.num_experts, config.moe_router_topk, hidden,
+                                   gpn=int(os.environ.get("BEVERIN_T6_GPN", 4)))
         assert self.hier.NLE == num_local_experts
         self._pl = None
         self._tpe = None
