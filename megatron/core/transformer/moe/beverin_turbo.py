@@ -43,6 +43,44 @@ def _dummy_grad(w):
         t = _DUMMY[key] = torch.zeros(w.shape, dtype=w.dtype, device=w.device)
     return t
 _CK = None
+# bench2 B4: BEVERIN_GG_TILES=<json> pins the tile config of Primus' persistent Triton grouped GEMM (fwd/dgrad, used
+# with BEVERIN_TURBO_GG_BACKEND=TRITON or BEVERIN_TURBO_PTR=1) and of the variable-K wgrad kernels (Primus bf16 and
+# the fused fp32 wgrad of BEVERIN_TURBO_FUSED_WGRAD) per problem, instead of origami's pick or the fixed default.
+# JSON: {"fwd": [[N, K, trans_b, G or null, [BM, BN, BK, group_m, cache_a, cache_b, stages, chunk]], ...],
+#        "vk": [[OUT_M, OUT_N, G or null, [...]], ...]}. Unlisted problems keep the original choice.
+_TILES_DONE = []
+
+
+def _install_tiles():
+    path = os.environ.get("BEVERIN_GG_TILES")
+    if not path or _TILES_DONE:
+        return
+    _TILES_DONE.append(1)
+    import json
+    import primus_turbo.triton.grouped_gemm.grouped_gemm_kernel as gk
+    t = json.load(open(path))
+    fwd = {(int(a[0]), int(a[1]), bool(a[2]), a[3]): tuple(a[4]) for a in t.get("fwd", [])}
+    vk = {(int(a[0]), int(a[1]), a[2]): tuple(a[3]) for a in t.get("vk", [])}
+    of, ov = gk._get_gg_bf16_fwd_config, gk._get_gg_bf16_vk_config
+
+    def fwd_cfg(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms):
+        c = fwd.get((N, K, bool(trans_b), G)) or fwd.get((N, K, bool(trans_b), None))
+        return c if c is not None else of(avg_m, N, K, dtype_a, dtype_b, trans_b, G, num_sms)
+
+    def vk_cfg(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms):
+        c = vk.get((OUT_M, OUT_N, G)) or vk.get((OUT_M, OUT_N, None))
+        return c if c is not None else ov(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms)
+
+    gk._get_gg_bf16_fwd_config, gk._get_gg_bf16_vk_config = fwd_cfg, vk_cfg
+    for mod, name, fn in (("megatron.core.transformer.moe.beverin_gg", "_get_gg_bf16_fwd_config", fwd_cfg),
+                          ("megatron.core.transformer.moe.beverin_vk", "_get_gg_bf16_vk_config", vk_cfg)):
+        try:
+            import importlib
+            setattr(importlib.import_module(mod), name, fn)
+        except Exception:  # noqa: BLE001
+            pass
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(f"beverin_turbo: BEVERIN_GG_TILES {path}: {len(fwd)} fwd/dgrad and {len(vk)} wgrad tile configs", flush=True)
 
 
 def _ops():
@@ -75,6 +113,7 @@ def _ops():
         # BEVERIN_TURBO_GG_BACKEND=CK|TRITON (smallscale gg_bench, job 677157: Triton 14 to 31% faster
         # than CK on varying per-expert shapes, wgrad 1.4 to 1.6x)
         _be = getattr(BackendType, os.environ.get("BEVERIN_TURBO_GG_BACKEND", "CK")).value
+        _install_tiles()
         _CK = (_be, grouped_gemm_compute_offs, grouped_gemm_impl,
                grouped_gemm_variable_k_impl)
     return _CK
