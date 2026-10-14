@@ -4,6 +4,10 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
+
+# bench2 B2: BEVERIN_NO_P2P_SYNC=1 skips the device-wide torch.cuda.synchronize() after every batched pipeline
+# p2p (a workaround for an old batch_isend_irecv race); the requests are still waited on the compute stream.
+_BEVERIN_NO_P2P_SYNC = __import__("os").environ.get("BEVERIN_NO_P2P_SYNC", "0") == "1"
 import torch.distributed as dist
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -260,7 +264,8 @@ class P2PCommunicator:
 
             # To protect against race condition when using batch_isend_irecv().
             # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            if not _BEVERIN_NO_P2P_SYNC:
+                torch.cuda.synchronize()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
@@ -413,7 +418,7 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if config.batch_p2p_comm and config.batch_p2p_sync and not _BEVERIN_NO_P2P_SYNC:
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
             torch.cuda.synchronize()
