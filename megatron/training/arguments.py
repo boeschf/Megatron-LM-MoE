@@ -3138,6 +3138,8 @@ def _add_distributed_args(parser):
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
                        help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
+    group.add_argument('--overlap-p2p-comm-warmup-flush', action='store_true', default=False,
+                       help='lab2 A4: also overlap pipeline p2p in the warm-up and flush phases of the interleaved schedule')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--ddp-num-buckets', type=int, default=None,
