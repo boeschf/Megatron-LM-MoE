@@ -1400,7 +1400,16 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            # Beverin (bench2 B3): BEVERIN_FUSED_OUT_GATE=1 runs the gate as one Triton kernel
+            # per direction (torch.compile, which fuses it on GH200, is off on Beverin).
+            import os as _os
+
+            if _os.environ.get("BEVERIN_FUSED_OUT_GATE", "0") == "1":
+                from megatron.core.extensions.beverin_gate import sigmoid_gate
+
+                core_attn_out = sigmoid_gate(core_attn_out, gate)
+            else:
+                core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # release after output gate
@@ -1509,6 +1518,16 @@ class SelfAttention(Attention):
             )
         else:
             self.k_layernorm = None
+
+        # Beverin (bench2 B3): BEVERIN_QKNORM_FLA=1 runs the q/k RMSNorm through FLA's Triton
+        # RMSNorm (TE ROCm's weight-gradient reduction is slow for 128-wide rows).
+        import os as _os
+
+        if _os.environ.get("BEVERIN_QKNORM_FLA", "0") == "1":
+            from megatron.core.extensions.beverin_qknorm import maybe_replace
+
+            self.q_layernorm = maybe_replace(self.q_layernorm, self.config)
+            self.k_layernorm = maybe_replace(self.k_layernorm, self.config)
 
     def run_realtime_tests(self):
         """Performs a consistency check.

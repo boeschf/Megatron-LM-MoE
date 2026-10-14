@@ -230,6 +230,11 @@ def _fused_kda_gate_supports_lower_bound() -> bool:
 
 _KDA_FUSED_GATE_SUPPORTS_LOWER_BOUND = _fused_kda_gate_supports_lower_bound()
 
+# Beverin (bench2 B3): KDA_DISABLE_RECOMPUTE=1 passes disable_recompute=True to chunk_kda.
+_KDA_DISABLE_RECOMPUTE = _env_flag("KDA_DISABLE_RECOMPUTE", False) and _chunk_kda_supports(
+    "disable_recompute"
+)
+
 logger = logging.getLogger(__name__)
 _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED = False
 
@@ -1221,6 +1226,11 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         nvtx_range_push(suffix="chunk_kda")
         kda_kwargs = self._kda_kernel_options(A_log_local_cp, dt_bias_local_cp)
+        # Beverin (bench2 B3): keep chunk_kda's forward intermediates (h, w, u, qg, kg,
+        # v_new) for the backward instead of recomputing them (about 360 MiB more per
+        # KDA layer-microbatch at mid-4b, MBS 1; about -0.6 to -0.8 ms per layer on MI300A).
+        if _KDA_DISABLE_RECOMPUTE and torch.is_grad_enabled():
+            kda_kwargs["disable_recompute"] = True
         kda_kwargs.update(
             g=g,
             beta=beta,

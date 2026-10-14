@@ -1557,6 +1557,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        from megatron.core.extensions import beverin_aiter_attn as _bva
+
+        if _bva.enabled() and _bva.usable(
+            self, attention_mask, attn_mask_type, attention_bias, packed_seq_params
+        ):
+            return _bva.forward(self, query, key, value, packed_seq_params)
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
