@@ -21,8 +21,12 @@ _TIMING = os.environ.get("BEVERIN_T6_TIMING", "0") == "1"
 # BEVERIN_T6_DEVTPE=1 (T6 t6-0005, ported by A4): hand the experts a device copy of tokens-per-expert (from the plan's
 # all-gather, already on the device), so the turbo expert MLP does no blocking H2D copy (forward and expert recompute).
 _DEVTPE = os.environ.get("BEVERIN_T6_DEVTPE", "0") == "1"
+_K3_TOPK = os.environ.get("BEVERIN_K3_TOPK", "0") == "1"
+_K3_GSUM = os.environ.get("BEVERIN_K3_GSUM", "0") == "1"
 _QB = 128  # fp8 block: columns per scale
-_STASH = os.environ.get("BEVERIN_DISPATCH_STASH", "0") == "1"  # lab2 A6: keep r2 for the expert recompute
+_STASH = os.environ.get("BEVERIN_DISPATCH_STASH", "0") == "1"
+# C1 (bench2): fused pack / gather-sum kernels, int32 stable sort, count GEMV in the plan (default off)
+_FUSED = os.environ.get("BEVERIN_T6_FUSED", "0") == "1"  # lab2 A6: keep r2 for the expert recompute
 TIMES = {}
 
 
@@ -109,6 +113,132 @@ try:
         s = tl.load(sp + b, mask=bm, other=0.0)
         tl.store(out_ptr + r.to(tl.int64) * H + cols, (q * s[:, None]).to(out_ptr.dtype.element_ty), mask=m)
 
+    # ---- C1 (bench2): fused T6 front and back ends (BEVERIN_T6_FUSED=1) ----
+    @triton.jit(do_not_specialize=["x_stride", "p_stride"])
+    def _pack1_kernel(x_ptr, idx1_ptr, eid_ptr, probs_ptr, buf_ptr, x_stride, p_stride, row_bytes, s_off, po, io,
+                      H, NB, K: tl.constexpr, NBP: tl.constexpr, QB: tl.constexpr, FMAX: tl.constexpr,
+                      FP8: tl.constexpr, HB: tl.constexpr):
+        # packed dispatch row r for token src = idx1[r]: x (fp8 + scales, or bf16) | probs[src, eid[src, :]] fp32 | eid int16
+        r = tl.program_id(0)
+        src = tl.load(idx1_ptr + r).to(tl.int64)
+        row = buf_ptr + r.to(tl.int64) * row_bytes
+        if FP8:
+            b = tl.arange(0, NBP)
+            c = tl.arange(0, QB)
+            bm = b < NB
+            cols = b[:, None] * QB + c[None, :]
+            m = bm[:, None] & (c[None, :] < QB)
+            x = tl.load(x_ptr + src * x_stride + cols, mask=m, other=0.0).to(tl.float32)
+            amax = tl.max(tl.abs(x), axis=1)
+            s = tl.maximum(amax, 1e-20) / FMAX
+            q = (x / s[:, None]).to(tl.float8e4b8)
+            tl.store(row + cols, q.to(tl.uint8, bitcast=True), mask=m)
+            tl.store((row + s_off).to(tl.pointer_type(tl.float32)) + b, s, mask=bm)
+        else:
+            cc = tl.arange(0, HB)
+            xm = cc < H
+            xv = tl.load(x_ptr + src * x_stride + cc, mask=xm, other=0.0)
+            tl.store(row.to(tl.pointer_type(tl.bfloat16)) + cc, xv.to(tl.bfloat16), mask=xm)
+        k = tl.arange(0, K)
+        e = tl.load(eid_ptr + src * K + k)
+        p = tl.load(probs_ptr + src * p_stride + e).to(tl.float32)
+        tl.store((row + po).to(tl.pointer_type(tl.float32)) + k, p)
+        tl.store((row + io).to(tl.pointer_type(tl.int16)) + k, e.to(tl.int16))
+
+    @triton.jit(do_not_specialize=["n_src", "H", "sx_stride", "sp_stride", "ox_stride", "op_stride"])
+    def _gsum_packed_kernel(sx_ptr, sp_ptr, inv_ptr, gp_ptr, ox_ptr, op_ptr, n_src, H, sx_stride, sp_stride,
+                            ox_stride, op_stride, W: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr,
+                            MODE: tl.constexpr):
+        # MODE 0: ox[r] = sum_w sx[inv[r, w]] (fp32 acc), op[r, :K] = sum_w sp[inv[r, w], :K]
+        # MODE 1 (dispatch bwd, expert side): ox[r] = sum_w sx[inv[r, w]], op[r, w] = gp[inv[r, w]] (0 if none)
+        r = tl.program_id(0)
+        hb = tl.program_id(1)
+        cols = hb * BLOCK + tl.arange(0, BLOCK)
+        m = cols < H
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        kk = tl.arange(0, K)
+        pacc = tl.zeros([K], dtype=tl.float32)
+        for w in tl.static_range(W):
+            j = tl.load(inv_ptr + r * W + w)
+            if j < n_src:
+                acc += tl.load(sx_ptr + j.to(tl.int64) * sx_stride + cols, mask=m, other=0.0).to(tl.float32)
+                if hb == 0:
+                    if MODE == 0:
+                        pacc += tl.load(sp_ptr + j.to(tl.int64) * sp_stride + kk)
+                    else:
+                        g = tl.load(gp_ptr + j).to(tl.float32)
+                        pacc += tl.where(kk == w, g, 0.0)
+        tl.store(ox_ptr + r.to(tl.int64) * ox_stride + cols, acc.to(ox_ptr.dtype.element_ty), mask=m)
+        if hb == 0:
+            tl.store(op_ptr + r.to(tl.int64) * op_stride + kk, pacc)
+
+    @triton.jit(do_not_specialize=["NN", "T"])
+    def _plan_kernel(rm_ptr, idx_ptr, nn_ptr, ng_ptr, part_ptr, NN, T, NE: tl.constexpr, K: tl.constexpr,
+                     E: tl.constexpr, NLE: tl.constexpr, G: tl.constexpr, NNP: tl.constexpr, BT: tl.constexpr):
+        # BT tokens per program: expert ids (ascending), node / GPU need flags, and per-block partial counts
+        # part[b] = [tokens per node (NN) | per GPU (E) | per expert (NE)]
+        b = tl.program_id(0)
+        t = b * BT + tl.arange(0, BT)
+        tm = t < T
+        e = tl.arange(0, NE)
+        r = tl.load(rm_ptr + t.to(tl.int64)[:, None] * NE + e[None, :], mask=tm[:, None], other=0).to(tl.int32)
+        r = tl.where(r != 0, 1, 0)
+        c = tl.cumsum(r, 1) - 1
+        tl.store(idx_ptr + t.to(tl.int64)[:, None] * K + c, (e[None, :] + 0 * c).to(tl.int64),
+                 mask=(r > 0) & (c < K) & tm[:, None])
+        gf = tl.max(tl.reshape(r, [BT, E, NLE]), 2)
+        tl.store(ng_ptr + t.to(tl.int64)[:, None] * E + tl.arange(0, E)[None, :], gf.to(tl.int8), mask=tm[:, None])
+        nf = tl.max(tl.reshape(gf, [BT, NNP, G]), 2)
+        tl.store(nn_ptr + t.to(tl.int64)[:, None] * NN + tl.arange(0, NNP)[None, :], nf.to(tl.int8), mask=tm[:, None])
+        W = NNP + E + NE
+        tl.store(part_ptr + b * W + tl.arange(0, NNP), tl.sum(nf, 0))
+        tl.store(part_ptr + b * W + NNP + tl.arange(0, E), tl.sum(gf, 0))
+        tl.store(part_ptr + b * W + NNP + E + e, tl.sum(r, 0))
+
+    # stable counting sort / compaction in two launches (replaces cumsum + where + scatter, or a radix sort)
+    @triton.jit(do_not_specialize=["N", "R", "W", "KS", "KW", "KOFF", "VALID"])
+    def _cs_hist_kernel(key_ptr, hist_ptr, N, R, W, KS, KW, KOFF, VALID, NBK: tl.constexpr, BLOCK: tl.constexpr, BOOL: tl.constexpr):
+        b = tl.program_id(0)
+        i = b * BLOCK + tl.arange(0, BLOCK)
+        m = i < N
+        mem = (i % R) * W + i // R
+        k = tl.load(key_ptr + (mem // KW) * KS + mem % KW, mask=m, other=0).to(tl.int32)
+        if BOOL:
+            k = 1 - k
+        else:
+            k = k - KOFF
+            k = tl.where((k >= 0) & (k < VALID), k, VALID)
+        k = tl.where(m, k, NBK)
+        oh = (k[:, None] == tl.arange(0, NBK)[None, :]).to(tl.int32)
+        tl.store(hist_ptr + b * NBK + tl.arange(0, NBK), tl.sum(oh, 0))
+
+    @triton.jit(do_not_specialize=["N", "R", "W", "KS", "KW", "KOFF", "nblk", "VALID", "SENT", "MODR"])
+    def _cs_scatter_kernel(key_ptr, hist_ptr, pos_ptr, perm_ptr, N, R, W, KS, KW, KOFF, nblk, VALID, SENT, MODR,
+                           NBK: tl.constexpr, BLOCK: tl.constexpr, NBLKP: tl.constexpr, BOOL: tl.constexpr):
+        b = tl.program_id(0)
+        rows = tl.arange(0, NBLKP)
+        cb = tl.arange(0, NBK)
+        Hh = tl.load(hist_ptr + rows[:, None] * NBK + cb[None, :], mask=(rows < nblk)[:, None], other=0)
+        tot = tl.sum(Hh, 0)
+        prev = tl.sum(tl.where((rows < b)[:, None], Hh, 0), 0)
+        base = tl.cumsum(tot, 0) - tot + prev
+        i = b * BLOCK + tl.arange(0, BLOCK)
+        m = i < N
+        mem = (i % R) * W + i // R
+        k = tl.load(key_ptr + (mem // KW) * KS + mem % KW, mask=m, other=0).to(tl.int32)
+        if BOOL:
+            k = 1 - k
+        else:
+            k = k - KOFF
+            k = tl.where((k >= 0) & (k < VALID), k, VALID)
+        k = tl.where(m, k, NBK)
+        oh = (k[:, None] == cb[None, :]).to(tl.int32)
+        within = tl.cumsum(oh, 0) - oh
+        pos = tl.sum(within * oh, 1) + tl.sum(oh * base[None, :], 1)
+        valid = m & (k < VALID)
+        tl.store(pos_ptr + mem, tl.where(valid, pos.to(tl.int64), SENT), mask=m)
+        tl.store(perm_ptr + pos, (i % MODR).to(tl.int64), mask=valid)
+
     _HAVE_TRITON = os.environ.get("BEVERIN_T6_TRITON", "1") == "1"
 except Exception:  # pragma: no cover
     _HAVE_TRITON = False
@@ -122,8 +252,12 @@ def _gather_sum(src, inv, dtype):
         out = torch.empty(R, Hd, dtype=dtype, device=src.device)
         if R and Hd:
             BLOCK = 1024 if Hd >= 1024 else triton.next_power_of_2(max(Hd, 16))
+            nw = 4
+            if _K3_GSUM and Hd <= 2048:  # bench2 K3 (k3-0004): whole row per program (1280 -> 2048), -22% at mid-4b
+                BLOCK = triton.next_power_of_2(max(Hd, 16))
             _gather_sum_kernel[(R, triton.cdiv(Hd, BLOCK))](src, inv.contiguous(), out, src.shape[0], Hd,
-                                                             src.stride(0), out.stride(0), W=W, BLOCK=BLOCK)
+                                                             src.stride(0), out.stride(0), W=W, BLOCK=BLOCK,
+                                                             num_warps=nw)
         return out
     pad = torch.cat([src, src.new_zeros((1, Hd))], 0)
     acc = pad.index_select(0, inv[:, 0]).float()
@@ -169,9 +303,29 @@ def _a2a(x, out_splits, in_splits, group):
     return out
 
 
+def _csort(key, R, W, nbk, valid, sent, modr, nperm, boolkey, ks=1, kw=1, koff=0, pos_shape=None):
+    """Stable counting sort of N = R * W keys taken in (w, r) order from key[r * W + w]; returns pos (same layout as
+    key, sent where key >= valid) and perm [nperm] (logical index % modr of each sorted valid slot)."""
+    N = R * W
+    BLOCK = 512 if nbk <= 64 else 256
+    nblk = max(triton.cdiv(N, BLOCK), 1)
+    dev = key.device
+    hist = torch.empty(nblk, nbk, dtype=torch.int32, device=dev)
+    pos = torch.empty(pos_shape if pos_shape is not None else key.shape, dtype=torch.long, device=dev)
+    perm = torch.empty(max(nperm, 1), dtype=torch.long, device=dev)
+    if N:
+        _cs_hist_kernel[(nblk,)](key, hist, N, R, W, ks, kw, koff, valid, NBK=nbk, BLOCK=BLOCK, BOOL=boolkey)
+        _cs_scatter_kernel[(nblk,)](key, hist, pos, perm, N, R, W, ks, kw, koff, nblk, valid, sent, modr, NBK=nbk, BLOCK=BLOCK,
+                                    NBLKP=triton.next_power_of_2(nblk), BOOL=boolkey)
+    return pos, perm[:nperm]
+
+
 def _bucket(need, total):
     """need [R, W] bool -> (idx [total] source row of each slot in (w, r) order, inv [R, W] slot of (r, w) or total)."""
     R, W = need.shape
+    if _FUSED and _HAVE_TRITON and need.is_cuda:
+        inv, idx = _csort(need.contiguous().view(torch.int8), R, W, 2, 1, total, R, total, True)
+        return idx, inv
     flat = need.t().reshape(-1)
     pos = torch.cumsum(flat, 0) - 1
     slot = torch.where(flat, pos, torch.full_like(pos, total))
@@ -262,12 +416,38 @@ class HierEP:
         with _tm("p_plan"):
             E, G, NN, NLE, K = self.E, self.G, self.NN, self.NLE, self.K
             T = routing_map.shape[0]
-            idx = torch.topk(routing_map.to(torch.int8), K, dim=1, sorted=False).indices  # [T, K] expert ids
+            pk = (_FUSED and _HAVE_TRITON and routing_map.is_cuda and NN & (NN - 1) == 0 and E & (E - 1) == 0
+                  and NLE & (NLE - 1) == 0)
+            if pk:
+                rmi = routing_map.contiguous().view(torch.int8) if routing_map.dtype == torch.bool else \
+                    (routing_map != 0).contiguous().view(torch.int8)
+                idx = torch.empty(T, K, dtype=torch.long, device=rmi.device)
+                need_node = torch.empty(T, NN, dtype=torch.bool, device=rmi.device)
+                need_gpu = torch.empty(T, E, dtype=torch.bool, device=rmi.device)
+                BT = 32
+                nb = max(triton.cdiv(T, BT), 1)
+                part = torch.zeros(nb, NN + E + self.NE, dtype=torch.int32, device=rmi.device)
+                if T:
+                    _plan_kernel[(nb,)](rmi, idx, need_node.view(torch.int8), need_gpu.view(torch.int8), part, NN, T,
+                                        NE=self.NE, K=K, E=E, NLE=NLE, G=G, NNP=NN, BT=BT)
+                vec = part.sum(0, dtype=torch.long)
+            elif _K3_TOPK and routing_map.shape[1] <= 1024:  # bench2 K3 (k3-0002): same id set, ascending, one kernel
+                from megatron.core.transformer.moe.beverin_k3 import mask_to_idx
+                idx = mask_to_idx(routing_map, K)
+            else:
+                idx = torch.topk(routing_map.to(torch.int8), K, dim=1, sorted=False).indices  # [T, K] expert ids
             gpu = idx // NLE
-            node = gpu // G
-            need_node = torch.zeros(T, NN, dtype=torch.bool, device=idx.device).scatter_(1, node, True)
-            need_gpu = torch.zeros(T, E, dtype=torch.bool, device=idx.device).scatter_(1, gpu, True)
-            vec = torch.cat([need_node.sum(0), need_gpu.sum(0), routing_map.sum(0)]).long()
+            if not pk:
+                node = gpu // G
+                need_node = torch.zeros(T, NN, dtype=torch.bool, device=idx.device).scatter_(1, node, True)
+                need_gpu = torch.zeros(T, E, dtype=torch.bool, device=idx.device).scatter_(1, gpu, True)
+            if pk:
+                pass
+            elif os.environ.get("BEVERIN_T6_GEMV", "0") == "1":  # slower (681685): 0.47 -> 0.73 ms
+                cat = torch.cat([need_node, need_gpu, routing_map.bool()], 1).to(torch.float32)
+                vec = torch.ones(1, T, dtype=torch.float32, device=idx.device).matmul(cat).view(-1).round().long()
+            else:
+                vec = torch.cat([need_node.sum(0), need_gpu.sum(0), routing_map.sum(0)]).long()
             allv = torch.empty(E, vec.numel(), dtype=torch.long, device=vec.device)
             dist.all_gather_into_tensor(allv, vec, group=self.group)
             C = allv.cpu()  # sync
@@ -304,12 +484,19 @@ class HierEP:
             S1 = sum(pl["in1"])
             idx1, inv1 = _bucket(pl["need_node"], S1)
             buf1 = torch.empty(S1, RB, dtype=torch.uint8, device=dev)
-            if self.fp8:
+            if _FUSED and _HAVE_TRITON and S1:
+                pr = probs if probs.stride(1) == 1 else probs.contiguous()
+                _pack1_kernel[(S1,)](x, idx1, idx.contiguous(), pr, buf1, x.stride(0), pr.stride(0), RB, H, self.po,
+                                     self.io, H, H // _QB, K=K, NBP=triton.next_power_of_2(max(H // _QB, 1)), QB=_QB,
+                                     FMAX=240.0 if _fp8_dtype() == torch.float8_e4m3fnuz else 448.0, FP8=self.fp8,
+                                     HB=triton.next_power_of_2(H))
+            elif self.fp8:
                 _quant_into(buf1, x, idx1, H)
             else:
                 buf1[:, :2 * H].view(x.dtype).copy_(x.index_select(0, idx1))
-            buf1[:, self.po:self.po + 4 * K].view(torch.float32).copy_(probs.gather(1, idx).float().index_select(0, idx1))
-            buf1[:, self.io:self.io + 2 * K].view(torch.int16).copy_(idx.index_select(0, idx1).to(torch.int16))
+            if not (_FUSED and _HAVE_TRITON and S1):
+                buf1[:, self.po:self.po + 4 * K].view(torch.float32).copy_(probs.gather(1, idx).float().index_select(0, idx1))
+                buf1[:, self.io:self.io + 2 * K].view(torch.int16).copy_(idx.index_select(0, idx1).to(torch.int16))
         with _tm("d1_a2a_rail"):
             r1 = _a2a(buf1, pl["out1"], pl["in1"], self.g_rail)
         del buf1
@@ -328,13 +515,25 @@ class HierEP:
         del buf2
         with _tm("d3_unpack"):
             R2 = r2.shape[0]
-            e_loc = r2[:, self.io:self.io + 2 * K].view(torch.int16).long() - self.me * NLE
-            e_loc = torch.where((e_loc >= 0) & (e_loc < NLE), e_loc, torch.full_like(e_loc, NLE))
+            if not (_FUSED and _HAVE_TRITON):
+                e_loc = r2[:, self.io:self.io + 2 * K].view(torch.int16).long() - self.me * NLE
+                e_loc = torch.where((e_loc >= 0) & (e_loc < NLE), e_loc, torch.full_like(e_loc, NLE))
             N3 = int(pl["tpe"].sum())
-            q = torch.arange(R2 * K, device=dev)
-            order = torch.sort(e_loc.reshape(-1) * (R2 * K) + q).indices[:N3]
-            inv3 = torch.full((R2 * K,), N3, dtype=torch.long, device=dev)
-            inv3[order] = torch.arange(N3, device=dev)
+            if _FUSED and _HAVE_TRITON:
+                ids = r2.view(torch.int16)  # [R2, RB / 2]; expert ids at columns io / 2 .. io / 2 + K
+                inv3f, order = _csort(ids[:, self.io // 2:], R2 * K, 1, triton.next_power_of_2(NLE + 1), NLE, N3,
+                                      1 << 62, N3, False, ks=self.RB // 2, kw=K, koff=self.me * NLE,
+                                      pos_shape=(R2 * K,))
+            elif _FUSED:
+                order = torch.sort(e_loc.reshape(-1).to(torch.int32), stable=True).indices[:N3]
+            else:
+                q = torch.arange(R2 * K, device=dev)
+                order = torch.sort(e_loc.reshape(-1) * (R2 * K) + q).indices[:N3]
+            if _FUSED and _HAVE_TRITON:
+                inv3 = inv3f
+            else:
+                inv3 = torch.full((R2 * K,), N3, dtype=torch.long, device=dev)
+                inv3[order] = torch.arange(N3, device=dev)
             rows3 = order // K
             if self.fp8:
                 x3 = _dequant_gather(r2, rows3, H, x.dtype)
@@ -359,6 +558,42 @@ class HierEP:
         dev = gx3.device
         xdt = pl["xdt"]
         R2 = pl["R2"]
+        fz = _FUSED and _HAVE_TRITON and gx3.is_cuda and gx3.stride(1) == 1
+        BLK = 1024 if H >= 1024 else 256
+        if fz:
+            with _tm("db3"):
+                b = torch.empty(R2, 2 * H + 4 * K, dtype=torch.uint8, device=dev)
+                bx, bp = b[:, :2 * H].view(xdt), b[:, 2 * H:].view(torch.float32)
+                if R2:
+                    _gsum_packed_kernel[(R2, triton.cdiv(H, BLK))](gx3, gx3, pl["inv3"], gp3.float().contiguous(), bx, bp,
+                                                                  gx3.shape[0], H, gx3.stride(0), 0, bx.stride(0),
+                                                                  bp.stride(0), W=K, K=K, BLOCK=BLK, MODE=1)
+            with _tm("db2_a2a_node"):
+                b = _a2a(b, pl["in2"], pl["out2"], self.g_node)
+            with _tm("db2_sum"):
+                R1 = pl["inv2"].shape[0]
+                b2 = torch.empty(R1, 2 * H + 4 * K, dtype=torch.uint8, device=dev)
+                sx, sp = b[:, :2 * H].view(xdt), b[:, 2 * H:].view(torch.float32)
+                ox, op = b2[:, :2 * H].view(xdt), b2[:, 2 * H:].view(torch.float32)
+                W2 = pl["inv2"].shape[1]
+                if R1:
+                    _gsum_packed_kernel[(R1, triton.cdiv(H, BLK))](sx, sp, pl["inv2"], sp, ox, op, b.shape[0], H,
+                                                                  sx.stride(0), sp.stride(0), ox.stride(0), op.stride(0),
+                                                                  W=W2, K=K, BLOCK=BLK, MODE=0)
+            with _tm("db1_a2a_rail"):
+                b = _a2a(b2, pl["in1"], pl["out1"], self.g_rail)
+            with _tm("db1_sum"):
+                T = pl["T"]
+                gx = torch.empty(T, H, dtype=xdt, device=dev)
+                gpk = torch.empty(T, K, dtype=torch.float32, device=dev)
+                sx, sp = b[:, :2 * H].view(xdt), b[:, 2 * H:].view(torch.float32)
+                W1 = pl["inv1"].shape[1]
+                if T:
+                    _gsum_packed_kernel[(T, triton.cdiv(H, BLK))](sx, sp, pl["inv1"], sp, gx, gpk, b.shape[0], H,
+                                                                 sx.stride(0), sp.stride(0), gx.stride(0), gpk.stride(0),
+                                                                 W=W1, K=K, BLOCK=BLK, MODE=0)
+                gprobs = torch.zeros(T, self.NE, dtype=pl["pdt"], device=dev).scatter_(1, pl["idx"], gpk.to(pl["pdt"]))
+            return gx, gprobs
         with _tm("db3"):
             g2 = _gather_sum(gx3, pl["inv3"], xdt)  # [R2, H]
             gp2 = torch.zeros(R2 * K, dtype=torch.float32, device=dev)

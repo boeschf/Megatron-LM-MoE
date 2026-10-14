@@ -55,7 +55,15 @@ def _ptr_offsets(weights):
     return _offsets(ws)
 
 
+_K3_EMPTY = os.environ.get("BEVERIN_K3_EMPTY_DGRAD", "0") == "1"
+
+
 def _dummy_grad(w):
+    # bench2 K3 (k3-0001): AccumulateGrad clones a cached dummy (refcount > 1) into .grad for every expert weight
+    # and microbatch (480 DtoD copies per microbatch on a stage); a fresh uninitialised tensor is stolen instead.
+    # Safe because grad_added_to_main_grad is set, so the DDP hook never reads it.
+    if _K3_EMPTY:
+        return torch.empty_like(w)
     key = (tuple(w.shape), w.dtype, w.device)
     t = _DUMMY.get(key)
     if t is None:

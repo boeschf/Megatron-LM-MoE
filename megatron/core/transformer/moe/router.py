@@ -36,6 +36,21 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 # persistent MoE buffers for rerun state machine
 _RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta')
 
+import collections as _k3c
+import os as _k3os
+
+_K3_TOPK = _k3os.environ.get("BEVERIN_K3_TOPK", "0") == "1"
+_K3TopK = _k3c.namedtuple("_K3TopK", "values indices")
+
+
+def _k3_topk(x, k):
+    """bench2 K3 (k3-0002): torch.topk(x, k, dim=1) for [T, <=1024] scores as one Triton kernel (exact, sorted)."""
+    if _K3_TOPK and x.is_cuda and x.ndim == 2 and x.shape[1] <= 1024 and k <= 32:
+        from megatron.core.transformer.moe.beverin_k3 import row_topk
+        return _K3TopK(*row_topk(x, k))
+    return x.topk(k, dim=1)
+
+
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -417,10 +432,10 @@ class TopKRouter(Router):
                 and self.config.moe_token_drop_policy == "probs"
             )
             if (should_update_beta and (use_histogram or use_marin)) or compute_drop_priority:
-                topk_result = biased_scores.topk(self.topk + 1, dim=1)
+                topk_result = _k3_topk(biased_scores, self.topk + 1)
                 indices = topk_result.indices[:, : self.topk]
             else:
-                indices = biased_scores.topk(self.topk, dim=1).indices
+                indices = _k3_topk(biased_scores, self.topk).indices
             drop_priority = None
             if compute_drop_priority:
                 drop_priority = biased_scores - topk_result.values[:, -1:]

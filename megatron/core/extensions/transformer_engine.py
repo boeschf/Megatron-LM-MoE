@@ -2705,6 +2705,9 @@ try:
         is_cg_capturable: bool = False,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel"""
+        if os.environ.get("BEVERIN_K3_CE", "0") == "1" and (tp_group is None or tp_group.size() == 1):
+            from megatron.core.fusions.beverin_ce import cross_entropy as _k3_ce  # bench2 K3 (k3-0003)
+            return _k3_ce(logits, labels, -100)
         if _TE_SUPPORTS_CG_CAPTURABLE:
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             return parallel_cross_entropy(

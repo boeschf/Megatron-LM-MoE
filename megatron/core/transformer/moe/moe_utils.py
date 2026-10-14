@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os as _k3os
 import functools
 import math
 import os
@@ -1143,7 +1144,11 @@ def compute_routing_scores_for_aux_loss(
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
 
-        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        if _k3os.environ.get("BEVERIN_K3_TOPK", "0") == "1" and scores.ndim == 2 and scores.shape[1] <= 1024 and topk <= 32:
+            from megatron.core.transformer.moe.beverin_k3 import row_topk  # bench2 K3 (k3-0002)
+            top_indices = row_topk(scores, topk)[1]
+        else:
+            _, top_indices = torch.topk(scores, k=topk, dim=1)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     # Apply padding mask to scores if provided
