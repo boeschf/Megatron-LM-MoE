@@ -188,6 +188,46 @@ def _newton_schulz_ws(x: torch.Tensor, steps: int, coefficient_type: str, eps: f
     return out.mT if transpose else out
 
 
+# K7: stacked expert path. Same-shape 2D expert weights of a param group are stacked (in chunks
+# of at most BEVERIN_K7_CHUNK Newton-Schulz matrices) into a temporary 3D "merged expert" tensor
+# and stepped through the existing 3D code, with Newton-Schulz as batched GEMMs and the
+# hypersphere projection as one batched op. Per-parameter optimiser state is unchanged.
+_BEVERIN_K7 = _os.environ.get("BEVERIN_K7_BATCH", "0") == "1"
+_K7_CHUNK = int(_os.environ.get("BEVERIN_K7_CHUNK", "32"))
+_K7_ALL = _os.environ.get("BEVERIN_K7_ALL", "0") == "1"  # also non-expert same-shape params
+_K7_ATTRS = ("is_out_proj", "is_embedding_or_output_parameter", "is_router",
+             "is_md_output_parameter", "is_md_embedding_parameter", "tensor_model_parallel",
+             "partition_dim", "expert_tp", "allreduce")
+
+
+def _newton_schulz_batched(x: torch.Tensor, steps: int, coefficient_type: str, eps: float = 1e-7):
+    """_newton_schulz_ws for a [b, m, n] stack: same bf16 math, batched GEMMs."""
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        _COEFFICIENT_SETS,
+        get_coefficient_iterator,
+    )
+
+    transpose = x.size(-2) > x.size(-1)
+    if transpose:
+        x = x.mT
+    bsz, m, n = x.shape
+    X = torch.empty(bsz, m, n, dtype=torch.bfloat16, device=x.device)
+    X.copy_(torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps))
+    Xn = torch.empty_like(X)
+    A = torch.empty(bsz, m, m, dtype=torch.bfloat16, device=x.device)
+    B = torch.empty_like(A)
+    coefficient_sets = _COEFFICIENT_SETS[coefficient_type]
+    mode = "repeat_last" if coefficient_type in ("polar_express", "cans", "deepseekv4") else "cycle"
+    for a, b, c in get_coefficient_iterator(steps, coefficient_sets, mode=mode):
+        torch.bmm(X, X.mT, out=A)
+        torch.baddbmm(A, A, A, alpha=c, beta=b, out=B)
+        torch.baddbmm(X, B, X, alpha=1.0, beta=a, out=Xn)
+        X, Xn = Xn, X
+    del Xn, A, B
+    out = X.to(torch.float32)
+    return out.mT if transpose else out
+
+
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
@@ -577,11 +617,132 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             group["step"] += 1
             if "momentum_beta" not in group:  # Old checkpoint compat.
                 group["momentum_beta"] = group["beta1"]
-            for p in group["params"]:
+            for p in (self._k7_run(group, gains=False) if _BEVERIN_K7 else group["params"]):
                 if p.grad is not None:
                     self._param_step(p, group)
 
         return loss
+
+    # ---- K7: stacked expert path ----
+    def _k7_plan(self, group):
+        """Chunks of same-shape eligible params (cached per group) and the remaining params."""
+        plans = self.__dict__.setdefault("_k7_plans", {})
+        key = (id(group), len(group["params"]))
+        plan = plans.get(key)
+        if plan is not None:
+            return plan
+        buckets, singles = {}, []
+        tp_ok = lambda p: _tp_partition_dim(p) is None or (
+            self.pg_collection is not None and get_pg_size(
+                self.pg_collection.expt_tp if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp) == 1)
+        for p in group["params"]:
+            glu = self.split_fc1 and getattr(p, "glu_split_dim", None) == 0
+            ok = (group.get("use_orthogonal_updates") and p.ndim == 2
+                  and not getattr(p, "merged_offload_expert", False)
+                  and (_K7_ALL or getattr(p, "allreduce", True) is False)
+                  and not self.normalize_update_to_weight_norm
+                  and not self.is_qkv_fn(p) and tp_ok(p)
+                  and (glu or self._split_param_tensor(p, p, False) is None))
+            if not ok:
+                singles.append(p)
+                continue
+            k = (tuple(p.shape), p.dtype, glu,
+                 tuple(repr(getattr(p, a, None)) for a in _K7_ATTRS if a != "partition_dim"))
+            buckets.setdefault(k, []).append(p)
+        chunks = []
+        for k, ps in buckets.items():
+            if len(ps) < 2:
+                singles.extend(ps)
+                continue
+            n = max(1, _K7_CHUNK // (2 if k[2] else 1))
+            chunks.extend((ps[i:i + n], k[2]) for i in range(0, len(ps), n))
+        plan = (chunks, singles)
+        plans[key] = plan
+        if _os.environ.get("BEVERIN_K7_LOG", "1") == "1":
+            print(f"K7 group {id(group)}: {sum(len(c) for c, _ in chunks)} params in "
+                        f"{len(chunks)} chunks, {len(singles)} single; shapes "
+                        f"{sorted(set((k[0], k[2]) for k in buckets))}", flush=True)
+        return plan
+
+    def _k7_run(self, group, gains: bool):
+        chunks, singles = self._k7_plan(group)
+        rest = list(singles)
+        for chunk, glu in chunks:
+            if any(p.grad is None or p.grad.dtype != p.dtype for p in chunk):
+                rest.extend(chunk)
+                continue
+            keys = [frozenset(k for k, v in self.state[p].items() if torch.is_tensor(v))
+                    for p in chunk]
+            if any(k != keys[0] for k in keys):
+                rest.extend(chunk)
+                continue
+            self._k7_chunk_step(chunk, glu, group, gains, keys[0])
+        return rest
+
+    def _k7_chunk_step(self, chunk, glu, group, gains, keys):
+        fake = torch.stack([p.detach() for p in chunk])
+        fake.grad = torch.stack([p.grad for p in chunk])
+        p0 = chunk[0]
+        for a in _K7_ATTRS:
+            if hasattr(p0, a):
+                setattr(fake, a, getattr(p0, a))
+        fake.tensor_model_parallel = False
+        fake.merged_offload_expert = True
+        if glu:
+            fake.glu_split_dim = 1
+        st = self.state[fake]
+        for k in keys:
+            st[k] = torch.stack([self.state[p][k] for p in chunk])
+        try:
+            if gains:
+                self._maybe_init_gain_state(fake)
+                gain_grads = self._preprocess_gains(fake)
+                self._param_step(fake, group)
+                self._gains_step(fake, group, gain_grads)
+                self._apply_gains(fake)
+            else:
+                self._param_step(fake, group)
+            torch._foreach_copy_([p.data for p in chunk], list(fake.unbind(0)))
+            for k, v in st.items():
+                if not torch.is_tensor(v):
+                    continue
+                if k in keys:
+                    torch._foreach_copy_([self.state[p][k] for p in chunk], list(v.unbind(0)))
+                else:
+                    for p, t in zip(chunk, v.unbind(0)):
+                        self.state[p][k] = t.clone()
+        finally:
+            self.state.pop(fake, None)
+            fake.grad = None
+
+    def _k7_orthogonalize_batched(self, g, use_radius_scale: bool, is_router: bool):
+        """_orthogonalize_tensor (partition_dim None) for a [b, m, n] stack."""
+        orth = _newton_schulz_batched(g, self.num_ns_steps, self.coefficient_type)
+        size = [g.size(-2), g.size(-1)]
+        if use_radius_scale and self.hypersphere_radius_mode == "fan_in":
+            scale = self._fan_in_update_scale(size[0], size[1])
+        else:
+            scale = _get_muon_scale_factor(
+                size[0], size[1], mode=self._resolve_scale_mode(is_router)
+            )
+            if use_radius_scale:
+                scale *= self._init_radius_scale(size[0], size[1])
+        return orth * scale * self.extra_scale_factor
+
+    def _k7_normalize_batched(self, x, is_out_proj: bool, mode: str, radius_scale: float):
+        """_normalize_single (partition_dim None) for a [b, m, n] stack, in place."""
+        dim2 = {"col": 0, "row": 1, "flat": None, "embed": 0 if is_out_proj else 1}.get(mode, "bad")
+        if dim2 == "bad":
+            raise ValueError(f"Unsupported hypersphere mode: {mode}")
+        dim3 = (1, 2) if dim2 is None else dim2 + 1
+        norm = torch.norm(x, dim=dim3, keepdim=True).clamp_min(self.hypersphere_eps)
+        x.div_(norm)
+        radius = self._target_slice_radius(dim2, x.size(-2), x.size(-1))
+        if radius != 1.0:
+            x.mul_(radius)
+        if radius_scale != 1.0:
+            x.mul_(radius_scale)
 
     def _param_step(self, p, group):
         grad = p.grad
@@ -817,6 +978,16 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             tp_group = None
         norm_partition_dim = _tp_partition_dim(p)
         partition_dim = None if self.tp_mode == "blockwise" else norm_partition_dim
+
+        if (_BEVERIN_K7 and is_merged_offload_expert and grad.ndim == 3
+                and partition_dim is None and not self.normalize_update_to_weight_norm
+                and not is_qkv and grad.dtype == torch.float32
+                and torch.get_float32_matmul_precision() == "medium"):
+            E, m, n = grad.shape
+            glu = self.split_fc1 and getattr(p, "glu_split_dim", None) == 1
+            g = grad.reshape(E * 2, m // 2, n) if glu else grad
+            out = self._k7_orthogonalize_batched(g, use_radius_scale, is_router)
+            return out.reshape(E, m, n) if glu else out
 
         split = self._split_param_tensor(p, grad, is_qkv)
         if split is not None:
@@ -1199,6 +1370,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         radius_scale = self._resolve_radius_scale(is_out_proj)
 
         is_expert_tp = getattr(p, "expert_tp", False)
+        if (_BEVERIN_K7 and is_merged_offload_expert and x.ndim == 3 and partition_dim is None
+                and not is_qkv and x.is_contiguous()):
+            E, m, n = x.shape
+            glu = self.split_fc1 and getattr(p, "glu_split_dim", None) == 1
+            self._k7_normalize_batched(x.view(E * 2, m // 2, n) if glu else x,
+                                       is_out_proj, mode, radius_scale)
+            return
         split = self._split_param_tensor(p, x, is_qkv)
         if split is not None:
             parts, merge = split
@@ -1510,6 +1688,26 @@ class MDDecoupling(_MDDecouplingBase):
 
     @torch.no_grad()
     def step(self, closure=None):
+        if _os.environ.get("BEVERIN_K7_TIME", "0") != "1":
+            return self._step_impl(closure)
+        # K7 measurement only: synchronised wall time of the optimiser step, logged every 5 steps.
+        import time as _time
+        torch.cuda.synchronize()
+        t0 = _time.perf_counter()
+        out = self._step_impl(closure)
+        torch.cuda.synchronize()
+        n = self.__dict__.setdefault("_k7_nsteps", 0) + 1
+        self._k7_nsteps = n
+        self._k7_tsum = self.__dict__.get("_k7_tsum", 0.0) + (_time.perf_counter() - t0)
+        if n % 5 == 0:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            nparams = sum(len(g["params"]) for g in self.param_groups)
+            print(f"K7TIME rank {rank} steps {n} md_step_ms {self._k7_tsum / 5 * 1e3:.1f} "
+                  f"params {nparams} batch {int(_BEVERIN_K7)}", flush=True)
+            self._k7_tsum = 0.0
+        return out
+
+    def _step_impl(self, closure=None):
         if self.hypersphere_gains_mode is None:
             return super().step(closure)
 
@@ -1522,7 +1720,7 @@ class MDDecoupling(_MDDecouplingBase):
             group["step"] += 1
             if "momentum_beta" not in group:
                 group["momentum_beta"] = group["beta1"]
-            for p in group["params"]:
+            for p in (self._k7_run(group, gains=True) if _BEVERIN_K7 else group["params"]):
                 if p.grad is not None:
                     self._maybe_init_gain_state(p)
                     gain_grads = self._preprocess_gains(p)

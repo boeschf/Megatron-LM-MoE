@@ -47,6 +47,7 @@ def _beverin_gg_ptr_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    PTAB: tl.constexpr = False,  # bench2 K4: b_goff_ptr holds int64 addresses of each group's weight (any span)
 ):
     """Persistent grouped GEMM kernel (CPU-sync-free).
 
@@ -113,11 +114,15 @@ def _beverin_gg_ptr_kernel(
 
         # Cast group_idx to int64 to prevent overflow in B group offset
         # (group_idx * stride_bg can exceed int32 when B has many groups)
-        group_offset_b = tl.multiple_of(tl.load(b_goff_ptr + group_idx), 16)
-        tl.assume(group_offset_b >= 0)
+        if PTAB:
+            B_G = tl.load(b_goff_ptr + group_idx).to(tl.pointer_type(B.dtype.element_ty))
+        else:
+            group_offset_b = tl.multiple_of(tl.load(b_goff_ptr + group_idx), 16)
+            tl.assume(group_offset_b >= 0)
+            B_G = B + group_offset_b
 
         A_BASE = A + m_start_g * stride_am + rm[:, None] * stride_am + rk[None, :] * stride_ak
-        B_BASE = B + group_offset_b + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        B_BASE = B_G + rk[:, None] * stride_bk + rn[None, :] * stride_bn
 
         # ── K-loop (identical to single GEMM) ──
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
@@ -144,7 +149,7 @@ def _beverin_gg_ptr_kernel(
         if not EVEN_K:
             rk_last = loop_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
             A_LAST = A + m_start_g * stride_am + rm[:, None] * stride_am + rk_last[None, :] * stride_ak
-            B_LAST = B + group_offset_b + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
+            B_LAST = B_G + rk_last[:, None] * stride_bk + rn[None, :] * stride_bn
             if stride_ak == 1:
                 A_LAST = tl.multiple_of(A_LAST, (1, 16))
             else:
@@ -174,8 +179,10 @@ def grouped_gemm_ptr(
     group_offs: torch.Tensor,
     b_goff: torch.Tensor,
     trans_b: bool = False,
+    ptab: bool = False,
 ) -> torch.Tensor:
-    """As Primus-Turbo grouped_gemm_triton_kernel, but b is only group 0's weight viewed as [1, ., .] and
+    """ptab (bench2 K4): b_goff holds int64 addresses (data_ptr) of each group's weight instead of element offsets.
+    As Primus-Turbo grouped_gemm_triton_kernel, but b is only group 0's weight viewed as [1, ., .] and
     b_goff[g] (int64, elements) locates group g's weight relative to it."""
     """Persistent grouped GEMM (CPU-sync-free) using Triton.
 
@@ -263,6 +270,7 @@ def grouped_gemm_ptr(
         waves_per_eu=0,
         matrix_instr_nonkdim=16,
         kpack=1,
+        PTAB=ptab,
     )
     return out
 

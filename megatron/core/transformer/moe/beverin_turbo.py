@@ -39,6 +39,28 @@ def _offsets(tensors):
 _PTR_WARNED = []
 
 
+# bench2 K4: BEVERIN_K4_PTAB=1 runs the PTR grouped GEMM with a table of weight addresses when the local experts'
+# weights span 2 GiB or more (one layer per rank under the layer-wise optimiser), instead of torch.stack + Primus
+_K4_PTAB = os.environ.get("BEVERIN_K4_PTAB", "0") == "1"
+
+
+def _mg_offsets(mgs):
+    """bench2 K4: _offsets for the fused wgrad's fp32 main grads, or (with BEVERIN_K4_PTAB=1) an address table when they
+    span 2 GiB or more."""
+    if _K4_PTAB:
+        lo = min(m.data_ptr() for m in mgs)
+        hi = max(m.data_ptr() + m.numel() * m.element_size() for m in mgs)
+        if hi - lo >= 2**31:
+            key = ("ptab",) + tuple(m.data_ptr() for m in mgs)
+            hit = _GOFF.get(key)
+            if hit is None:
+                if len(_GOFF) > 4096:
+                    _GOFF.clear()
+                hit = _GOFF[key] = (mgs[0], torch.tensor(list(key[1:]), dtype=torch.int64, device=mgs[0].device), True)
+            return hit
+    return _offsets(mgs)
+
+
 def _ptr_offsets(weights):
     """bench2 B2: _offsets for the PTR path, or None when the weights span more than 2 GiB (then the caller falls
     back to the stacked path; mid-4b's expert weights are not adjacent under the layer-wise optimiser)."""
@@ -47,6 +69,14 @@ def _ptr_offsets(weights):
     ws = [w.detach() for w in weights]
     lo = min(w.data_ptr() for w in ws)
     hi = max(w.data_ptr() + w.numel() * w.element_size() for w in ws)
+    if hi - lo >= 2**31 and _K4_PTAB:
+        key = ("ptab",) + tuple(w.data_ptr() for w in ws)
+        hit = _GOFF.get(key)
+        if hit is None:
+            if len(_GOFF) > 4096:
+                _GOFF.clear()
+            hit = _GOFF[key] = (ws[0], torch.tensor(list(key[1:]), dtype=torch.int64, device=ws[0].device), True)
+        return hit
     if hi - lo >= 2**31:
         if not _PTR_WARNED:
             _PTR_WARNED.append(1)
@@ -171,8 +201,8 @@ class _TurboExpertLinear(torch.autograd.Function):
         if po is not None:
             from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
 
-            wb, goff = po
-            out = grouped_gemm_ptr(x, wb.unsqueeze(0), offs, goff, trans_b=True)
+            wb, goff = po[0], po[1]
+            out = grouped_gemm_ptr(x, wb.unsqueeze(0), offs, goff, trans_b=True, ptab=len(po) > 2)
         else:
             w = _stacked_view(weights)
             out = gg(x, w, group_lens, offs, trans_a=False, trans_b=True, num_cu=NUM_CU,
@@ -194,8 +224,8 @@ class _TurboExpertLinear(torch.autograd.Function):
         if po is not None:
             from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
 
-            wb, goff = po
-            grad_x = grouped_gemm_ptr(grad_out, wb.unsqueeze(0), offs, goff, trans_b=False)
+            wb, goff = po[0], po[1]
+            grad_x = grouped_gemm_ptr(grad_out, wb.unsqueeze(0), offs, goff, trans_b=False, ptab=len(po) > 2)
         else:
             w = _stacked_view(weights)
             grad_x = gg(grad_out, w, group_lens, offs, trans_a=False, trans_b=False, num_cu=NUM_CU,
@@ -212,8 +242,8 @@ class _TurboExpertLinear(torch.autograd.Function):
                 and x.is_contiguous()):
             from megatron.core.transformer.moe.beverin_vk import vk_accum
 
-            mb, moff = _offsets(mgs)
-            vk_accum(grad_out, x, offs, mb, moff)
+            mo = _mg_offsets(mgs)
+            vk_accum(grad_out, x, offs, mo[0], mo[1], ptab=len(mo) > 2)
             for w in weights:
                 w.grad_added_to_main_grad = True
             return (grad_x, None, None, *[_dummy_grad(w) for w in weights])
@@ -236,8 +266,8 @@ def _delayed_wgrad(x, grad_out, wl, group_lens, offs, weights, fuse=True):
             and x.is_contiguous()):
         from megatron.core.transformer.moe.beverin_vk import vk_accum
 
-        mb, moff = _offsets(mgs)
-        vk_accum(grad_out, x, offs, mb, moff)
+        mo = _mg_offsets(mgs)
+        vk_accum(grad_out, x, offs, mo[0], mo[1], ptab=len(mo) > 2)
         for w in weights:
             w.grad_added_to_main_grad = True
     else:

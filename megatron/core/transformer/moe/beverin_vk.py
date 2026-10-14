@@ -50,6 +50,7 @@ def _beverin_vk_accum_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    PTAB: tl.constexpr = False,  # bench2 K4: c_goff_ptr holds int64 addresses of each group's fp32 main grad
 ):
     """Persistent grouped variable-K GEMM kernel for backward pass (CPU-sync-free).
 
@@ -165,16 +166,20 @@ def _beverin_vk_accum_kernel(
         rn_raw = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_raw[None, :] < OUT_N)
         # Cast group_idx to int64 to prevent overflow in C group offset
-        c_off = tl.multiple_of(tl.load(c_goff_ptr + group_idx), 16)
-        tl.assume(c_off >= 0)
-        C_ = C + c_off + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        if PTAB:
+            C_G = tl.load(c_goff_ptr + group_idx).to(tl.pointer_type(tl.float32))
+        else:
+            c_off = tl.multiple_of(tl.load(c_goff_ptr + group_idx), 16)
+            tl.assume(c_off >= 0)
+            C_G = C + c_off
+        C_ = C_G + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         c_old = tl.load(C_, mask=c_mask, other=0.0)
         tl.store(C_, c_old + acc, c_mask)
 
 
 
 
-def vk_accum(lhs, rhs, group_offs, c0, c_goff):
+def vk_accum(lhs, rhs, group_offs, c0, c_goff, ptab=False):
     """c0 + c_goff[g] (fp32, row-major [OUT_M, OUT_N]) += lhs_g^T @ rhs_g for every group g.
     lhs: [M_total, OUT_M] (grad_out), rhs: [M_total, OUT_N] (x), bf16, contiguous."""
     assert lhs.ndim == 2 and rhs.ndim == 2 and lhs.shape[0] == rhs.shape[0]
@@ -198,5 +203,5 @@ def vk_accum(lhs, rhs, group_offs, c0, c_goff):
         BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=BLOCK_K, GROUP_SIZE_M=group_m,
         NUM_SMS=num_sms, NUM_XCDS=NUM_XCDS, CHUNK_SIZE=chunk_size, IS_FP8=False,
         CACHE_MODIFIER_A=cache_a, CACHE_MODIFIER_B=cache_b,
-        num_warps=8, num_stages=num_stages_val, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1,
+        num_warps=8, num_stages=num_stages_val, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1, PTAB=ptab,
     )
