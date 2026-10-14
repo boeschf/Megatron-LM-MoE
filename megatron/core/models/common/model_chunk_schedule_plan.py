@@ -16,6 +16,23 @@ from megatron.core.pipeline_parallel.utils import (
 )
 
 
+# lab2 A4: BEVERIN_A4_TRACE_DIR=<dir> writes a host-side, line-flushed trace of the combined-1F1B schedule per rank
+# (layer pairs, comm nodes, pipeline p2p), to locate cross-stage hangs. Off by default.
+import os as _a4os, time as _a4time
+_A4_DIR = _a4os.environ.get("BEVERIN_A4_TRACE_DIR")
+_A4_FH = [None]
+
+
+def _a4t(msg):
+    if not _A4_DIR:
+        return
+    if _A4_FH[0] is None:
+        _a4os.makedirs(_A4_DIR, exist_ok=True)
+        _A4_FH[0] = open(f"{_A4_DIR}/r{_a4os.environ.get('RANK', '0')}.txt", "a", buffering=1)
+    _A4_FH[0].write(f"{_a4time.time():.3f} {msg}\n")
+
+
+
 class ModelChunkState:
     """State shared across a model chunk.
 
@@ -78,6 +95,7 @@ class TransformerLayerSchedulePlan:
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
+        self._a4_ln = getattr(layer, "layer_number", -1)
         self.event = event
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
@@ -255,10 +273,12 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
+        _a4t(f"L f={f_layer._a4_ln if f_layer is not None else '-'} b={b_layer._a4_ln if b_layer is not None else '-'}")
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_post_combine.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
+            _a4t("cb")
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -274,10 +294,12 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
+                _a4t("df")
 
         if b_layer is not None:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
+            _a4t("db")
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
@@ -290,6 +312,7 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
+                _a4t("cf")
                 # f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
@@ -505,6 +528,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         f_input = None
         if f_schedule_plan:
             # pp output send/receive sync
+            _a4t(f"CHUNK f vp={f_schedule_plan.vp_stage} b={'-' if b_schedule_plan is None else b_schedule_plan.vp_stage}")
             if pre_forward is not None:
                 pre_forward(f_schedule_plan.vp_stage)
             f_schedule_plan.record_current_stream()
@@ -564,13 +588,17 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # so the p2p comm could be overlapped with the attn backward
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
+                _a4t(f"pf vp={f_schedule_plan.vp_stage}")
                 post_forward(f_input, f_schedule_plan.vp_stage)
+                _a4t("pf done")
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
         # so the p2p comm could be overlapped with the wgrad of attn backward
         if b_schedule_plan is not None and post_backward is not None:
             b_schedule_plan.wait_current_stream()
+            _a4t(f"pb vp={b_schedule_plan.vp_stage}")
             post_backward(b_grad, b_schedule_plan.vp_stage)
+            _a4t("pb done")
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm
