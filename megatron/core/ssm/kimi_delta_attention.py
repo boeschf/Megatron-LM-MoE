@@ -254,6 +254,7 @@ def _warn_kda_legacy_gate_bias_once() -> None:
 
 
 _K2_CONV = os.environ.get("BEVERIN_K2_CONV", "0") == "1"
+_K2_CONV_NORM = os.environ.get("BEVERIN_K2_CONV_NORM", "0") == "1"
 
 
 @dataclass
@@ -881,7 +882,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         seq_idx = self._seq_idx_for_cu_seqlens(cu_seqlens) if cu_seqlens is not None else None
         if not projected.is_contiguous():
             projected = projected.contiguous()
-        q, k, v, tail = kda_split_conv(projected, self.conv1d.weight, seq_idx, self.qk_dim_local_tp)
+        norm_qk = _K2_CONV_NORM and self._qk_l2norm_in_kernel and self.key_head_dim == 128
+        q, k, v, tail = kda_split_conv(projected, self.conv1d.weight, seq_idx, self.qk_dim_local_tp, norm_qk=norm_qk)
         lr = self.gate_low_rank_dim
         decay_low_rank, gate_low_rank, beta = torch.split(tail, [lr, lr, self.num_value_heads], dim=-1)
         alpha, _ = self.decay_out_proj(decay_low_rank)
@@ -893,6 +895,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         alpha = alpha.transpose(0, 1).contiguous()
         q = q.view(batch, seq_len, -1, self.key_head_dim)
         k = k.view(batch, seq_len, -1, self.key_head_dim)
+        if norm_qk:
+            q._k2_normed = True  # chunk_kda must not normalise again (see _kda_core)
         v = v.view(batch, seq_len, -1, self.value_head_dim)
         return q, k, v, gate, beta, alpha
 
@@ -1261,6 +1265,8 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         nvtx_range_push(suffix="chunk_kda")
         kda_kwargs = self._kda_kernel_options(A_log_local_cp, dt_bias_local_cp)
+        if getattr(query, "_k2_normed", False):
+            kda_kwargs["use_qk_l2norm_in_kernel"] = False
         # Beverin (bench2 B3): keep chunk_kda's forward intermediates (h, w, u, qg, kg,
         # v_new) for the backward instead of recomputing them (about 360 MiB more per
         # KDA layer-microbatch at mid-4b, MBS 1; about -0.6 to -0.8 ms per layer on MI300A).

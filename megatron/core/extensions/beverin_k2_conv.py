@@ -37,7 +37,8 @@ def _ldseq(sb, r, T):
 @triton.jit
 def _k2_conv_fwd(x_ptr, w_ptr, seq_ptr, y_ptr, T, B,
                  sxt: tl.constexpr, sxb: tl.constexpr, CS: tl.constexpr,
-                 BT: tl.constexpr, BC: tl.constexpr, HAS_SEQ: tl.constexpr, CFIRST: tl.constexpr):
+                 BT: tl.constexpr, BC: tl.constexpr, HAS_SEQ: tl.constexpr, CFIRST: tl.constexpr,
+                 NORM: tl.constexpr = False, HD: tl.constexpr = 128):
     if CFIRST:
         pid_c = tl.program_id(0)
         pid_t = tl.program_id(1)
@@ -93,6 +94,12 @@ def _k2_conv_fwd(x_ptr, w_ptr, seq_ptr, y_ptr, T, B,
         else:
             z = x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3
         y = z * tl.sigmoid(z)
+        if NORM:
+            # per-head L2 norm of q and k (segments 0 and 1), as FLA's l2norm_fwd (eps 1e-6)
+            y2 = tl.reshape(y, [BC // HD, HD])
+            rs = 1.0 / tl.sqrt(tl.sum(y2 * y2, axis=1) + 1e-6)
+            yn = tl.reshape(y2 * rs[:, None], [BC])
+            y = tl.where(seg < 2, yn, y)
         tl.store(yb + r.to(tl.int64) * CS + cl, y.to(yb.dtype.element_ty), mask=(r < T) & (c >= 0))
         x0 = x1
         x1 = x2
@@ -102,7 +109,8 @@ def _k2_conv_fwd(x_ptr, w_ptr, seq_ptr, y_ptr, T, B,
 @triton.jit
 def _k2_conv_bwd(x_ptr, w_ptr, seq_ptr, dy_ptr, dx_ptr, dw_ptr, T, c_off,
                  sxt: tl.constexpr, sxb: tl.constexpr, CS: tl.constexpr,
-                 BT: tl.constexpr, BC: tl.constexpr, HAS_SEQ: tl.constexpr, CFIRST: tl.constexpr):
+                 BT: tl.constexpr, BC: tl.constexpr, HAS_SEQ: tl.constexpr, CFIRST: tl.constexpr,
+                 NORM: tl.constexpr = False, HD: tl.constexpr = 128):
     # Rows r = t0 .. t0+BT+2 walked in order. z[r], dz[r] (needs x[r-3..r], dy[r]);
     # dx[r-3] = dz[r-3] w3 + dz[r-2] w2 + dz[r-1] w1 + dz[r] w0 once r-3 >= t0;
     # dw[j] += dz[r] x[r-3+j] for r in [t0, t0+BT).
@@ -188,6 +196,13 @@ def _k2_conv_bwd(x_ptr, w_ptr, seq_ptr, dy_ptr, dx_ptr, dw_ptr, T, c_off,
             e2 = x2
         z = e0 * w0 + e1 * w1 + e2 * w2 + x3 * w3
         sg = tl.sigmoid(z)
+        if NORM:
+            # dy is the gradient w.r.t. the normalised output: undo the per-head L2 norm (FLA's l2norm_bwd)
+            y2 = tl.reshape(z * sg, [BC // HD, HD])
+            rs = 1.0 / tl.sqrt(tl.sum(y2 * y2, axis=1) + 1e-6)
+            yn = y2 * rs[:, None]
+            g2 = tl.reshape(dy, [BC // HD, HD])
+            dy = tl.reshape(g2 * rs[:, None] - tl.sum(g2 * yn, axis=1)[:, None] * yn * rs[:, None], [BC])
         dz = dy * sg * (1.0 + z * (1.0 - sg))
         if i < BT:
             a0 += dz * e0
@@ -224,15 +239,15 @@ def _k2_conv_bwd(x_ptr, w_ptr, seq_ptr, dy_ptr, dx_ptr, dw_ptr, T, c_off,
 _CF = int(os.environ.get("K2_CONV_CFIRST", "1"))
 _FBT = int(os.environ.get("K2_CONV_BT", "32"))
 _FBC = int(os.environ.get("K2_CONV_BC", "512"))
-_FNW = int(os.environ.get("K2_CONV_WARPS", "2"))
-_BBT = int(os.environ.get("K2_CONV_BT_BWD", "32"))
+_FNW = int(os.environ.get("K2_CONV_WARPS", "4"))
+_BBT = int(os.environ.get("K2_CONV_BT_BWD", "64"))
 _BBC = int(os.environ.get("K2_CONV_BC_BWD", str(_FBC)))
 _BNW = int(os.environ.get("K2_CONV_WARPS_BWD", str(_FNW)))
 
 
 class KdaSplitConv(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, projected, weight, seq_idx, CS):
+    def forward(ctx, projected, weight, seq_idx, CS, norm_qk=False):
         S, B, W = projected.shape
         assert projected.stride(2) == 1 and projected.stride(1) == W and projected.stride(0) == B * W
         C = 3 * CS
@@ -246,10 +261,11 @@ class KdaSplitConv(torch.autograd.Function):
             assert seq_idx.shape == (B, S) and seq_idx.is_contiguous() and seq_idx.dtype == torch.int32
         _k2_conv_fwd[(C // _FBC, triton.cdiv(S, _FBT), B) if _CF else (triton.cdiv(S, _FBT), C // _FBC, B)](
             projected, w, seq, y, S, B, sxt=B * W, sxb=W, CS=CS,
-            BT=_FBT, BC=_FBC, HAS_SEQ=seq_idx is not None, CFIRST=_CF, num_warps=_FNW)
+            BT=_FBT, BC=_FBC, HAS_SEQ=seq_idx is not None, CFIRST=_CF, NORM=norm_qk, num_warps=_FNW)
         tail = projected[..., C:].contiguous()
         ctx.save_for_backward(projected, w, seq_idx)
         ctx.CS = CS
+        ctx.norm_qk = norm_qk
         ctx.wshape = weight.shape
         return y[0], y[1], y[2], tail
 
@@ -267,21 +283,24 @@ class KdaSplitConv(torch.autograd.Function):
             dy = dy.contiguous() if dy is not None else torch.zeros(B, S, CS, device=projected.device, dtype=projected.dtype)
             _k2_conv_bwd[(CS // _BBC, NT, B) if _CF else (NT, CS // _BBC, B)](
                 projected, w, seq, dy, dproj, dwp, S, i * CS, sxt=B * W, sxb=W, CS=CS,
-                BT=_BBT, BC=_BBC, HAS_SEQ=seq_idx is not None, CFIRST=_CF, num_warps=_BNW)
+                BT=_BBT, BC=_BBC, HAS_SEQ=seq_idx is not None, CFIRST=_CF, NORM=ctx.norm_qk and i < 2,
+                num_warps=_BNW)
         if dtail is not None:
             dproj[..., C:].copy_(dtail)
         else:
             dproj[..., C:].zero_()
         dw = dwp.sum(0).to(w.dtype).reshape(ctx.wshape)
-        return dproj, dw, None, None
+        return dproj, dw, None, None, None
 
 
-def kda_split_conv(projected, weight, seq_idx=None, CS=None):
+def kda_split_conv(projected, weight, seq_idx=None, CS=None, norm_qk=False):
     """projected [S, B, W] contiguous; weight [3*CS, 1, 4] or [3*CS, 4]; seq_idx [B, S] int32 or None.
-    Returns q, k, v contiguous [B, S, CS] (SiLU(causal conv)), tail [S, B, W - 3*CS] contiguous."""
+    Returns q, k, v contiguous [B, S, CS] (SiLU(causal conv)), tail [S, B, W - 3*CS] contiguous.
+    norm_qk: also L2-normalise q and k per 128-wide head (FLA's l2norm, eps 1e-6), so chunk_kda runs
+    with use_qk_l2norm_in_kernel=False."""
     if CS is None:
         CS = weight.shape[0] // 3
-    return KdaSplitConv.apply(projected, weight, seq_idx, CS)
+    return KdaSplitConv.apply(projected, weight, seq_idx, CS, norm_qk)
 
 
 def reference(projected, weight, seq_idx=None, CS=None):
