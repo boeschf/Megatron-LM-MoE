@@ -36,6 +36,25 @@ def _offsets(tensors):
     return hit
 
 
+_PTR_WARNED = []
+
+
+def _ptr_offsets(weights):
+    """bench2 B2: _offsets for the PTR path, or None when the weights span more than 2 GiB (then the caller falls
+    back to the stacked path; mid-4b's expert weights are not adjacent under the layer-wise optimiser)."""
+    if not all(w.is_contiguous() for w in weights):
+        return None
+    ws = [w.detach() for w in weights]
+    lo = min(w.data_ptr() for w in ws)
+    hi = max(w.data_ptr() + w.numel() * w.element_size() for w in ws)
+    if hi - lo >= 2**31:
+        if not _PTR_WARNED:
+            _PTR_WARNED.append(1)
+            print(f"B2PTR fallback: expert weights span {(hi - lo) / 2**30:.1f} GiB", flush=True)
+        return None
+    return _offsets(ws)
+
+
 def _dummy_grad(w):
     key = (tuple(w.shape), w.dtype, w.device)
     t = _DUMMY.get(key)
@@ -140,10 +159,11 @@ class _TurboExpertLinear(torch.autograd.Function):
     def forward(ctx, x, group_lens, module, *weights):
         ck, compute_offs, gg, gg_vk = _ops()
         offs = compute_offs(group_lens)
-        if PTR and all(w.is_contiguous() for w in weights):
+        po = _ptr_offsets(weights) if PTR else None
+        if po is not None:
             from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
 
-            wb, goff = _offsets([w.detach() for w in weights])
+            wb, goff = po
             out = grouped_gemm_ptr(x, wb.unsqueeze(0), offs, goff, trans_b=True)
         else:
             w = _stacked_view(weights)
@@ -162,10 +182,11 @@ class _TurboExpertLinear(torch.autograd.Function):
         ctx.weights = None
         module, ctx.module = ctx.module, None
         grad_out = grad_out.contiguous()
-        if PTR and all(w.is_contiguous() for w in weights):
+        po = _ptr_offsets(weights) if PTR else None
+        if po is not None:
             from megatron.core.transformer.moe.beverin_gg import grouped_gemm_ptr
 
-            wb, goff = _offsets([w.detach() for w in weights])
+            wb, goff = po
             grad_x = grouped_gemm_ptr(grad_out, wb.unsqueeze(0), offs, goff, trans_b=False)
         else:
             w = _stacked_view(weights)
