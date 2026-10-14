@@ -253,6 +253,9 @@ def _warn_kda_legacy_gate_bias_once() -> None:
     _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED = True
 
 
+_K2_CONV = os.environ.get("BEVERIN_K2_CONV", "0") == "1"
+
+
 @dataclass
 class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
     """KDA projections in addition to the shared GDN input/output modules."""
@@ -863,6 +866,36 @@ class KimiDeltaAttention(GatedDeltaNet):
             kwargs["allow_neg_eigval"] = self.config.linear_attention_allow_neg_eigval
         return kwargs
 
+    def _k2_conv_ok(self):
+        return (self.tp_size == 1 and self.cp_size == 1 and not self.config.deterministic_mode
+                and not self.conv_bias and not self._full_rank_output_gate
+                and self.conv_kernel_dim == 4 and self.activation in ("silu", "swish")
+                and self.qk_dim_local_tp == self.v_dim_local_tp
+                and self.num_value_heads == self.num_key_heads
+                and not (self.use_qk_l2norm and not self._qk_l2norm_in_kernel))
+
+    def _k2_post_proj(self, projected, batch, seq_len, cu_seqlens):
+        """Beverin (bench2 K2): split + short conv + SiLU in one Triton kernel per direction,
+        writing contiguous q/k/v; the backward writes d(projected) directly."""
+        from megatron.core.extensions.beverin_k2_conv import kda_split_conv
+        seq_idx = self._seq_idx_for_cu_seqlens(cu_seqlens) if cu_seqlens is not None else None
+        if not projected.is_contiguous():
+            projected = projected.contiguous()
+        q, k, v, tail = kda_split_conv(projected, self.conv1d.weight, seq_idx, self.qk_dim_local_tp)
+        lr = self.gate_low_rank_dim
+        decay_low_rank, gate_low_rank, beta = torch.split(tail, [lr, lr, self.num_value_heads], dim=-1)
+        alpha, _ = self.decay_out_proj(decay_low_rank)
+        gate, gate_bias = self.gate_out_proj(gate_low_rank)
+        if gate_bias is not None and gate_bias.numel() > 0:
+            gate = gate + gate_bias
+        gate = gate.transpose(0, 1).reshape(batch, seq_len, -1, self.value_head_dim).contiguous()
+        beta = beta.transpose(0, 1).reshape(batch, seq_len, -1).contiguous()
+        alpha = alpha.transpose(0, 1).contiguous()
+        q = q.view(batch, seq_len, -1, self.key_head_dim)
+        k = k.view(batch, seq_len, -1, self.key_head_dim)
+        v = v.view(batch, seq_len, -1, self.value_head_dim)
+        return q, k, v, gate, beta, alpha
+
     def _in_proj_to_attn_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -904,6 +937,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         cu_seqlens=None,
     ):
         """In_proj output -> chunk_kda inputs; the region `qkv_fine` recomputes."""
+        if _K2_CONV and self._k2_conv_ok():
+            return self._k2_post_proj(projected, batch, seq_len, cu_seqlens)
         qkv_channels_split_sections = [
             self.qk_dim_local_tp,
             self.qk_dim_local_tp,
