@@ -56,7 +56,7 @@ def _fake_batch(args):
         "labels": torch.roll(tokens, -1, dims=1),
         "loss_mask": torch.ones(b, s, dtype=torch.float),
         "position_ids": torch.arange(s, dtype=torch.int64).unsqueeze(0).expand(b, s).contiguous(),
-        "attention_mask": None,
+
     }
     if getattr(args, "create_attention_mask_in_dataloader", False):
         batch["attention_mask"] = torch.tril(torch.ones((b, 1, s, s))) < 0.5
