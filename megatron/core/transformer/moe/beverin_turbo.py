@@ -243,7 +243,24 @@ class _TurboExpertLinear(torch.autograd.Function):
             from megatron.core.transformer.moe.beverin_vk import vk_accum
 
             mo = _mg_offsets(mgs)
-            vk_accum(grad_out, x, offs, mo[0], mo[1], ptab=len(mo) > 2)
+            mb, moff, pt = mo[0], mo[1], len(mo) > 2
+            from megatron.core.transformer.moe import beverin_o1 as _o1
+
+            if _o1.WGRAD_DEFER and not getattr(module, "_o1_nodefer", False):  # bench2 O1: launched at the next
+                # backward all-to-all (beverin_ep_t6); inputs whose storage gets resized to 0 must not be deferred
+                s = _o1.stream("wgrad")
+                for t in (grad_out, x, offs, moff):
+                    t.record_stream(s)
+                _o1.defer(lambda g=grad_out, a=x, o=offs, b=mb, f=moff, p=pt: vk_accum(g, a, o, b, f, ptab=p))
+            elif _o1.WGRAD_SIDE:  # bench2 O1: overlap the wgrad with what follows (dispatch backward all-to-all)
+                cur, s = torch.cuda.current_stream(), _o1.stream("wgrad")
+                s.wait_stream(cur)
+                with torch.cuda.stream(s):
+                    vk_accum(grad_out, x, offs, mb, moff, ptab=pt)
+                for t in (grad_out, x, offs, moff):
+                    t.record_stream(s)
+            else:
+                vk_accum(grad_out, x, offs, mb, moff, ptab=pt)
             for w in weights:
                 w.grad_added_to_main_grad = True
             return (grad_x, None, None, *[_dummy_grad(w) for w in weights])

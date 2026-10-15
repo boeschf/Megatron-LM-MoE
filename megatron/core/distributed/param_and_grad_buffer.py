@@ -647,6 +647,9 @@ class _ParamAndGradBucketGroup:
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
+        from megatron.core.transformer.moe import beverin_o1 as _o1
+
+        _o1.join()  # bench2 O1: side-stream wgrads must be in main_grad before the reduce
 
         # guarantee the main grad is fully synchronized
         if any(bucket.grad_data.device.type == "cpu" for bucket in self.buckets):
@@ -881,6 +884,9 @@ class _ParamAndGradBucketGroup:
         makes synchronous call.
         """
         self.param_gather_dispatched = False
+        from megatron.core.transformer.moe import beverin_o1 as _o1
+
+        _o1.join()  # bench2 O1
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)

@@ -686,6 +686,9 @@ class TEGroupedMLP(MegatronModule):
                     fc1_output, bias_parallel, permuted_probs, tokens_per_expert
                 )
         if _turbo:
+            # bench2 O1: fc2's input is discarded (storage resized to 0) right after this by the moe_act recompute,
+            # so its wgrad must not be deferred (BEVERIN_O1_WGRAD_SIDE=2), only launched on the side stream at once
+            self.linear_fc2._o1_nodefer = bool(self.activation_recompute)
             output = _beverin_turbo.expert_linear(self.linear_fc2, bias_act_output, group_lens)
             output_bias = None
         else:

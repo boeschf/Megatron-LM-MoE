@@ -16,6 +16,8 @@ import os
 import torch
 import torch.distributed as dist
 
+from megatron.core.transformer.moe import beverin_o1 as _o1
+
 _FP8 = os.environ.get("BEVERIN_T6_FP8", "0") == "1"
 _TIMING = os.environ.get("BEVERIN_T6_TIMING", "0") == "1"
 # BEVERIN_T6_DEVTPE=1 (T6 t6-0005, ported by A4): hand the experts a device copy of tokens-per-expert (from the plan's
@@ -300,6 +302,7 @@ def _a2a(x, out_splits, in_splits, group):
     out = x.new_empty((int(sum(out_splits)),) + tuple(x.shape[1:]))
     dist.all_to_all_single(out, x.contiguous(), output_split_sizes=out_splits, input_split_sizes=in_splits,
                            group=group)
+    _o1.flush()  # bench2 O1: queued expert wgrads (BEVERIN_O1_WGRAD_SIDE=2) run next to this all-to-all
     return out
 
 
@@ -349,9 +352,13 @@ def _pg_options(which):
     2.7x slower)."""
     mx = os.environ.get(f"BEVERIN_T6_{which}_MAX_CTAS")
     mn = os.environ.get(f"BEVERIN_T6_{which}_MIN_CTAS")
-    if not (mx or mn):
+    hp = os.environ.get("BEVERIN_T6_HIPRI", "0") == "1"  # bench2 O1: high-priority RCCL streams
+    nc = os.environ.get(f"BEVERIN_T6_{which}_NCHANNELS")  # bench2 O1: per-communicator channel config
+    if not (mx or mn or hp or nc):
         return None
-    opts = dist.ProcessGroupNCCL.Options()
+    opts = dist.ProcessGroupNCCL.Options(is_high_priority_stream=hp)
+    if nc:
+        opts.config.min_ctas = opts.config.max_ctas = int(nc)
     if mx:
         opts.config.max_ctas = int(mx)
     if mn:

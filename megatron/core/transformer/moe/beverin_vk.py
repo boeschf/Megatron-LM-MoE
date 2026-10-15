@@ -190,6 +190,9 @@ def vk_accum(lhs, rhs, group_offs, c0, c_goff, ptab=False):
     _cap = os.environ.get("BEVERIN_TURBO_NUM_CU")  # lab2 A3: persistent grid on fewer CUs
     if _cap:
         num_sms = max(NUM_XCDS, min(num_sms, int(_cap)) // NUM_XCDS * NUM_XCDS)
+    _o1cap = os.environ.get("BEVERIN_O1_VK_CU")  # bench2 O1: fused wgrad grid on fewer CUs (leave CUs to RCCL)
+    if _o1cap:
+        num_sms = max(NUM_XCDS, min(num_sms, int(_o1cap)) // NUM_XCDS * NUM_XCDS)
     dummy = torch.empty(1, device=lhs.device, dtype=torch.float32)
     if _is_gfx950():
         _set_knobs_gfx950()

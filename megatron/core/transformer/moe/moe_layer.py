@@ -691,10 +691,19 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
         # MoE forward: route -> dispatch -> compute -> combine
+        from megatron.core.transformer.moe import beverin_o1 as _o1
+
+        o1 = (_o1.SHARED_SIDE and intermediate_tensors is None and self.use_shared_expert
+              and not self.shared_expert_overlap and not self.shared_experts_recompute)
+
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
-                    shared_expert_output = self.shared_experts_compute(hidden_states)
+                    if o1:  # bench2 O1: computed on a side stream after the combine is launched
+                        shared_in, shared_ev = hidden_states, torch.cuda.current_stream().record_event()
+                        shared_expert_output = None
+                    else:
+                        shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
                     # FP8 dispatch (the only user of a scale factor) requires EP comm overlap
@@ -724,6 +733,14 @@ class MoELayer(BaseMoELayer):
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+                if o1:
+                    cur, s = torch.cuda.current_stream(), _o1.stream("shared")
+                    s.wait_event(shared_ev)
+                    with torch.cuda.stream(s):
+                        shared_expert_output = apply_module(self.shared_experts)(shared_in)
+                    shared_in.record_stream(s)
+                    shared_expert_output.record_stream(cur)
+                    cur.wait_stream(s)
                 # Reload the offloaded expert activations during the combine-backward
                 # window. No-op unless moe_offload_activations produced an active handle.
                 output = self._wrap_activation_reload(output)
