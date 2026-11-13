@@ -468,9 +468,13 @@ class TopKRouter(Router):
                 self.config.moe_expert_capacity_factor is not None
                 and self.config.moe_token_drop_policy == "probs"
             )
+            # Checkpoint forward and replay must select the same experts at ties.
+            # Only statistics accumulation below depends on grad mode.
             if (
-                should_update_beta and (use_histogram or use_marin or use_exact)
-            ) or compute_drop_priority:
+                (self.training and use_histogram)
+                or (should_update_beta and (use_marin or use_exact))
+                or compute_drop_priority
+            ):
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
