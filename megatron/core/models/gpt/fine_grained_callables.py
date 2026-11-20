@@ -18,6 +18,8 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.fp8_jit import (
+    cast_dispatch_fnuz,
+    dequant_dispatch_fnuz,
     per_token_cast_to_fp8,
     per_token_dequant_from_fp8,
 )
@@ -826,6 +828,11 @@ def build_fp8_dispatch_node_callables(layer):
         config.moe_token_dispatcher_type == "flex"
         and config.moe_flex_dispatcher_backend == "hybridep"
     )
+    use_fnuz = getattr(config, "moe_fp8_dispatch_fnuz", False)
+    if is_moe and use_fnuz and not (
+        config.moe_use_fp8_dispatch and config.overlap_moe_expert_parallel_comm and enable_deepep
+    ):
+        raise ValueError("Native E4M3FNUZ dispatch requires the overlapped flex/DeepEP FP8 schedule")
     if (
         not (is_moe and config.moe_use_fp8_dispatch and config.overlap_moe_expert_parallel_comm)
         or enable_hybridep
@@ -839,7 +846,10 @@ def build_fp8_dispatch_node_callables(layer):
 
     def pre_dispatch_fwd(node, local_tokens, local_tokens_sf, probs):
         assert local_tokens_sf is None, "local_tokens_sf should None before pre_dispatch_fwd"
-        fp8_tokens, sf = per_token_cast_to_fp8(local_tokens, use_ue8m0=False)
+        if use_fnuz:
+            fp8_tokens, sf = cast_dispatch_fnuz(local_tokens)
+        else:
+            fp8_tokens, sf = per_token_cast_to_fp8(local_tokens, use_ue8m0=False)
         fp8_tokens.requires_grad_(True)
         return fp8_tokens, sf, probs
 
@@ -848,7 +858,10 @@ def build_fp8_dispatch_node_callables(layer):
         return output_grad[0], None, output_grad[2]
 
     def post_dispatch_fwd(node, dispatched_tokens, dispatched_tokens_sf):
-        bf16_tokens = per_token_dequant_from_fp8(dispatched_tokens, dispatched_tokens_sf)
+        if use_fnuz:
+            bf16_tokens = dequant_dispatch_fnuz(dispatched_tokens, dispatched_tokens_sf)
+        else:
+            bf16_tokens = per_token_dequant_from_fp8(dispatched_tokens, dispatched_tokens_sf)
         bf16_tokens.requires_grad_(True)
         # Return a None sf slot so the mlp node still receives (tokens, sf) and its
         # dispatch_postprocess (dequant deferred) treats the input as already BF16.
@@ -882,6 +895,8 @@ def build_fp8_dispatch_node_callables(layer):
         handle = node.layer_state.dispatch_handle
         # probs grad flows back from the experts via the detached dispatched_probs.
         grad_dispatched_probs = node.detached[0].grad
+        if use_fnuz and output_grad[0].dtype != torch.bfloat16:
+            raise ValueError("Native E4M3FNUZ dispatch requires BF16 reverse communication")
         grad_local_tokens, grad_permuted_probs = fused_fp8_dispatch_bwd(
             output_grad[0].contiguous(),
             grad_dispatched_probs,
