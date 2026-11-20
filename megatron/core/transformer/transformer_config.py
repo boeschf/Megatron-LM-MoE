@@ -1093,6 +1093,12 @@ class TransformerConfig(ModelParallelConfig):
     is implemented via dedicated ScheduleNodes and therefore requires
     overlap_moe_expert_parallel_comm=True."""
 
+    moe_fp8_dispatch_fnuz: bool = False
+    """Use native gfx942 E4M3FNUZ with unpacked FP32 scales for asymmetric FP8 dispatch."""
+
+    moe_resident_fp8_fnuz: bool = False
+    """Use native gfx942 blockwise E4M3FNUZ GEMMs for resident routed SSSGLU experts."""
+
     moe_use_fp8_activation: bool = False
     """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
     be quantized into FP8 for storage."""
@@ -1943,6 +1949,66 @@ class TransformerConfig(ModelParallelConfig):
                 and self.moe_flex_dispatcher_backend == "hybridep"
             ):
                 raise ValueError("moe_use_fp8_dispatch does not support the HybridEP backend.")
+
+        if self.moe_fp8_dispatch_fnuz:
+            if (
+                not self.moe_use_fp8_dispatch
+                or self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "deepep"
+                or self.params_dtype != torch.bfloat16
+                or self.moe_latent_size != 1792
+            ):
+                raise ValueError(
+                    "Native FNUZ dispatch requires asymmetric FP8 dispatch with Flex/DeepEP, "
+                    "BF16 parameters and latent width 1792."
+                )
+            if self.cuda_graph_impl != "none":
+                raise ValueError("Native FNUZ dispatch graph capture is not yet qualified.")
+
+        if self.moe_resident_fp8_fnuz:
+            from megatron.core.activations import sssglu_act
+
+            if (
+                self.transformer_impl != "transformer_engine"
+                or not self.moe_grouped_gemm
+                or getattr(self, "moe_use_legacy_grouped_gemm", False)
+                or not self.num_moe_experts
+                or not self.gated_linear_unit
+                or self.activation_func != sssglu_act
+                or self.add_bias_linear
+                or self.params_dtype != torch.bfloat16
+                or self.expert_tensor_parallel_size != 1
+                or self.moe_latent_size != 1792
+                or self.moe_ffn_hidden_size != 1920
+            ):
+                raise ValueError(
+                    "Resident FNUZ requires BF16 TE grouped, bias-free SSSGLU experts "
+                    "with latent 1792, expert hidden 1920 and expert TP 1."
+                )
+            if (
+                not self.delay_wgrad_compute
+                or not self.overlap_moe_expert_parallel_comm
+                or self.gradient_accumulation_fusion
+                or self.cuda_graph_impl != "none"
+                or {"moe", "moe_act"}.intersection(self.recompute_modules or ())
+            ):
+                raise ValueError(
+                    "Resident FNUZ requires delayed wgrad in the EP overlap schedule; "
+                    "global accumulation fusion, graphs and MoE recomputation are not qualified."
+                )
+            if (
+                self.fp8 is not None
+                or self.fp4 is not None
+                or self.moe_use_fp8_activation
+                or self.moe_use_inplace_fp8_param
+                or self.moe_use_extra_fp8_param_storage
+                or self.moe_use_offloading_experts
+                or self.moe_offload_main_grad
+                or self.moe_offload_activations
+                or self.cpu_offloading
+                or self.fine_grained_activation_offloading
+            ):
+                raise ValueError("Resident FNUZ cannot be combined with global FP8/FP4 or offload.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

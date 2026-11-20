@@ -1724,6 +1724,24 @@ def validate_args(args, defaults={}):
             "on the weight-norm/gain, the second as a forward multiplier); enabling both "
             "double-counts and over-suppresses the residual branches. Enable exactly one.")
 
+    if args.moe_resident_fp8_fnuz:
+        if (
+            args.optimizer != "md_decoupling"
+            or not args.use_layer_wise_distributed_optimizer
+            or not args.overlap_grad_reduce
+            or not args.align_grad_reduce
+            or args.main_grads_dtype != torch.float32
+            or args.overlap_param_gather
+            or args.use_distributed_optimizer
+            or args.optimizer_cpu_offload
+            or args.use_torch_fsdp2
+            or args.use_megatron_fsdp
+        ):
+            raise ValueError(
+                "Resident FNUZ needs layer-wise md_decoupling, FP32 main gradients and "
+                "aligned gradient-reduce overlap, without offload, FSDP or parameter-gather overlap."
+            )
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (

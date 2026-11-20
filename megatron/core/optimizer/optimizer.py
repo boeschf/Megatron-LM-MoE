@@ -735,6 +735,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.fp32_from_float16_groups = []
             self.fp32_from_fp32_groups = []
             self.model_params = []
+            self._resident_fp8_model_params = []
 
             # For all the groups in the original optimizer:
             for param_group in self.optimizer.param_groups:
@@ -750,6 +751,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor', 'torch.BFloat16Tensor']:
                             float16_params_this_group.append(param)
+                            if getattr(param, "resident_fp8_delayed_wgrad", False):
+                                self._resident_fp8_model_params.append(param)
                             # Create a copy
                             if param.type() == 'torch.BFloat16Tensor':
                                 main_param = param.detach().clone().to(torch.cuda.current_device()).float()
@@ -870,6 +873,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         _multi_tensor_copy_this_to_that(
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
+        if self._resident_fp8_model_params:
+            # The copy above uses .data and does not track mutations on the BF16 Parameters.
+            # Invalidate their derived FNUZ views only after the authoritative write is enqueued.
+            torch.autograd.graph.increment_version(self._resident_fp8_model_params)
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"

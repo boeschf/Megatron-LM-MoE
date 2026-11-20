@@ -8,6 +8,7 @@ import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
+from ..num_microbatches_calculator import get_num_microbatches
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.moe.moe_offload import MoEOffloadManager
@@ -325,8 +326,40 @@ class DistributedDataParallel(_BaseDataParallel):
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
+        self._resident_fp8_delayed_params = []
+        self._resident_fp8_grad_counts = {}
+        self._resident_fp8_grad_streams = set()
+        resident_fp8_owners = {}
+        if getattr(config, "moe_resident_fp8_fnuz", False):
+            for module in self.module.modules():
+                register = getattr(module, "register_resident_fp8_main_grad_ready", None)
+                if register is None:
+                    continue
+                for param in module.parameters():
+                    if not getattr(param, "resident_fp8_delayed_wgrad", False):
+                        continue
+                    if param in resident_fp8_owners:
+                        raise RuntimeError("Resident FNUZ parameter has multiple wgrad owners.")
+                    resident_fp8_owners[param] = register
         for param in self.module.parameters():
             if param.requires_grad:
+                if getattr(param, "resident_fp8_delayed_wgrad", False):
+                    if (
+                        param not in resident_fp8_owners
+                        or param not in self.param_to_bucket_group
+                        or not self.ddp_config.delay_wgrad_compute
+                        or not self.ddp_config.overlap_grad_reduce
+                        or self.expt_dp_group.size() != 1
+                        or param.main_grad.dtype != torch.float32
+                        or not param.main_grad.is_cuda
+                    ):
+                        raise RuntimeError(
+                            "Resident FNUZ wgrad needs one owner, EDP1, overlapped delayed DDP "
+                            "and a GPU FP32 main_grad."
+                        )
+                    resident_fp8_owners[param](param, self._make_resident_fp8_ready_hook(param))
+                    self._resident_fp8_delayed_params.append(param)
+                    continue
                 # When delay_wgrad_compute is True and the param is marked with
                 # skip_backward_post_hook, register the backward post hook for its module
                 # instead of the param so that the wgrad accumulation and reduce will be performed
@@ -433,6 +466,40 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
 
         return hook
+
+    def _make_resident_fp8_ready_hook(self, param: torch.nn.Parameter):
+        """Register readiness after the expert has enqueued its FP32 contribution."""
+        def hook(completed_param):
+            # The adapter calls this on the stream ordered after its main_grad writes.
+            # No autograd weight gradient (including a BF16 sentinel) is consumed here.
+            if completed_param is not param or param.grad is not None or is_graph_capturing():
+                raise RuntimeError("Invalid resident FNUZ delayed wgrad completion.")
+            count = self._resident_fp8_grad_counts.get(param, 0) + 1
+            expected = get_num_microbatches()
+            if count > expected:
+                raise RuntimeError("Duplicate resident FNUZ wgrad completion.")
+            self._resident_fp8_grad_counts[param] = count
+            self._resident_fp8_grad_streams.add(torch.cuda.current_stream(param.device))
+            # The selected aligned schedule calls start_grad_sync explicitly. Calling
+            # register_grad_ready here would either be suppressed by no_sync or race
+            # that explicit collective.
+
+        return hook
+
+    def _wait_resident_fp8_grads(self):
+        if self._resident_fp8_delayed_params:
+            expected = get_num_microbatches()
+            for param in self._resident_fp8_delayed_params:
+                actual = self._resident_fp8_grad_counts.get(param, 0)
+                if actual != expected:
+                    raise RuntimeError(
+                        f"Resident FNUZ wgrad count {actual}, expected {expected} before grad sync."
+                    )
+            # Aligned reduction and finalization may run outside the expert compute stream.
+            current = torch.cuda.current_stream()
+            for stream in self._resident_fp8_grad_streams:
+                if current != stream:
+                    current.wait_stream(stream)
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """
@@ -544,6 +611,7 @@ class DistributedDataParallel(_BaseDataParallel):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
+        self._wait_resident_fp8_grads()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
@@ -556,6 +624,7 @@ class DistributedDataParallel(_BaseDataParallel):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
+        self._wait_resident_fp8_grads()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
@@ -574,6 +643,8 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
+        self._resident_fp8_grad_counts.clear()
+        self._resident_fp8_grad_streams.clear()
         if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back
