@@ -291,6 +291,14 @@ def check_fnuz_oracle_direct_division():
     assert legacy_bytes[0, 1:3].tolist() == [235, 83]
 
 
+def check_empty_drain_snapshots(snapshots, count):
+    """Compare the last two completed drains in their verified callback order."""
+    assert count > 0 and len(snapshots) >= 2 * count
+    previous, empty = snapshots[-2 * count : -count], snapshots[-count:]
+    for position, (before, after) in enumerate(zip(previous, empty, strict=True)):
+        assert torch.equal(after, before), f"empty drain changed snapshot {position}"
+
+
 def cpu_check():
     torch.set_num_threads(2)
     adapter = load_adapter()
@@ -348,13 +356,16 @@ def cpu_check():
             assert torch.all(p.main_grad == .125)
         for p, contribution in references:
             torch.testing.assert_close(p.main_grad, contribution + .125)
-        snapshots = [p.main_grad.clone() for p in experts.params]
+        drain_order = experts.fc2 + experts.fc1
+        snapshots = [p.main_grad.clone() for p in drain_order]
         last = experts._last_drain
         current_stream.return_value = consumer2
         experts.drain()
         assert consumer2.waits == [second.ready, last]
         assert len(notified) == 2 * len(experts.params)
-        assert all(torch.equal(p.main_grad, v) for p, v in zip(experts.params, snapshots))
+        assert [id(p) for p in notified[len(drain_order):]] == [id(p) for p in drain_order]
+        snapshots.extend(p.main_grad.clone() for p in drain_order)
+        check_empty_drain_snapshots(snapshots, len(drain_order))
         assert experts._outstanding == 0 and set(backend.calls.values()) == {2}
         assert backend.casts == {"weight": 4, "row": 10, "column": 8}
         expect_error(experts.drain, "no completed backward")
@@ -552,6 +563,8 @@ def native_check(device, trace_dir):
         order = experts.fc2 + experts.fc1
         num = len(order)
         assert ready[-num:] == [(id(param), consumer) for param in order]
+        if case == 2:
+            check_empty_drain_snapshots(snapshots, num)
         for param, snapshot in zip(order, snapshots[-num:]):
             error = check_error(
                 "FP32 main grad at callback",
@@ -560,9 +573,6 @@ def native_check(device, trace_dir):
                 LIMITS["dw"],
             )
             observed_errors.setdefault("dw", []).append(error)
-            if case == 2:
-                previous = snapshots[-2 * num : -num]
-                assert torch.equal(snapshot, previous[order.index(param)])
     assert len(ready) == 3 * len(experts.params) and experts._outstanding == 0
     assert backend.calls == {name: n_active for name in OPERATIONS}
     expect_error(module.backward_dw, "no completed backward")
