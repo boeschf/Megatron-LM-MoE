@@ -242,9 +242,30 @@ class CPUEvent:
         self.stream = stream
 
 
+def check_list_gemm_contract(adapter):
+    """Check the image 910 Python/pybind list contract without executing TE."""
+    backend = object.__new__(adapter._NativeBackend)
+    a = [torch.empty(128, 128), torch.empty(128, 128)]
+    b = [torch.empty(128, 128), torch.empty(256, 128)]
+    out = [torch.empty(128, 128), torch.empty(128, 128)]
+    calls = []
+
+    def grouped(A, B, D, quantizers, *, m_splits, **options):
+        assert A is a and B is b and D is out and quantizers == [None, None]
+        assert m_splits == [128, 256] and all(type(n) is int for n in m_splits)
+        assert options["single_output"] is False
+        calls.append((options["layout"], options["grad"], options["accumulate"]))
+
+    backend._grouped = grouped
+    for op, (layout, _) in OPERATIONS.items():
+        backend.gemm(op, a, b, out, layout=layout, accumulate=(layout == "NT"))
+    assert calls == [("TN", False, False)] * 2 + [("NN", True, False)] * 2 + [("NT", True, True)] * 2
+
+
 def cpu_check():
     torch.set_num_threads(2)
     adapter = load_adapter()
+    check_list_gemm_contract(adapter)
     experts = make_raw(adapter, "cpu", 3, 128, 128)
     backend = experts._backend = ObservedBackend(CPUBackend())
     producer, consumer, consumer2 = CPUStream(), CPUStream(), CPUStream()

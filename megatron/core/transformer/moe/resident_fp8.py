@@ -93,6 +93,9 @@ class _NativeBackend:
                 [None] * len(a),
                 out_dtype=out[0].dtype,
                 layout=layout,
+                # Image 910 forwards this to a non-optional C++ vector even
+                # with separate destinations. B always has padded tokens on axis 0.
+                m_splits=[b_i.shape[0] for b_i in b],
                 grad=not operation.endswith("_fwd"),
                 accumulate=accumulate,
                 use_bias=False,
