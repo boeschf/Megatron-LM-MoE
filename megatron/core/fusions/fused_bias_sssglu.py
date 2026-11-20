@@ -8,6 +8,28 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
+import os as _os
+
+_BEVERIN_FUSED_SSSGLU = _os.environ.get("BEVERIN_FUSED_SSSGLU", "0") == "1"
+
+
+def _beverin_sssglu_eligible(input, weights=None):
+    """Admit only ordinary contiguous BF16 D1920 rows and optional FP32 row weights."""
+    if not (_BEVERIN_FUSED_SSSGLU and type(input) is torch.Tensor
+            and input.is_cuda and input.dtype == torch.bfloat16
+            and input.layout == torch.strided and not input.is_nested
+            and input.ndim == 2 and input.shape[1] == 3840
+            and input.is_contiguous() and input.storage_offset() == 0):
+        return False
+    if weights is None:
+        return True
+    return (type(weights) is torch.Tensor and weights.is_cuda
+            and weights.dtype == torch.float32 and weights.device == input.device
+            and weights.layout == torch.strided and not weights.is_nested
+            and tuple(weights.shape) == (input.shape[0], 1)
+            and weights.is_contiguous() and weights.storage_offset() == 0)
+
+
 ###### BIAS SSSGLU FUSION/ NO AUTOGRAD ################
 # SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign:
 #   gate(x)  = softsign(x - 1) + 0.5 = (x - 1) / (1 + |x - 1|) + 0.5   (== sssglu_act in activations.py)
@@ -203,7 +225,11 @@ def bias_sssglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
-    if bias is not None:
+    if bias is None and not fp8_input_store and not cpu_offload_input and _beverin_sssglu_eligible(input):
+        from megatron.core.fusions.beverin_sssglu import TritonSSSGLU
+
+        output = TritonSSSGLU.apply(input)
+    elif bias is not None:
         output = BiasSSSGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
     else:
         output = SSSGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
@@ -220,6 +246,10 @@ def weighted_bias_sssglu_impl(input, bias, weights, fp8_input_store=False):
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted sssglu fusion")
+    elif not fp8_input_store and weights is not None and _beverin_sssglu_eligible(input, weights):
+        from megatron.core.fusions.beverin_sssglu import TritonWeightedSSSGLU
+
+        output = TritonWeightedSSSGLU.apply(input, weights)
     else:
         output = WeightedSSSGLUFunction.apply(input, weights, fp8_input_store)
 
