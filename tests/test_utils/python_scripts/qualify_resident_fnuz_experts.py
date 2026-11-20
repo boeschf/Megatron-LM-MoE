@@ -60,6 +60,12 @@ def check_error(label, actual, expected, limits):
     return norms
 
 
+def divided_fp32(numerator, denominator):
+    """Round the direct quotient to FP32, without an intermediate FP32 reciprocal."""
+    den = denominator.to(torch.float64)
+    return torch.div(torch.full_like(den, numerator), den).to(torch.float32)
+
+
 def quant_blocks(value, max_fp8, dtype, axes):
     """Independent finite cast oracle (FP32 inverse scale, RNE, saturating cast)."""
     m, k = value.shape
@@ -74,10 +80,13 @@ def quant_blocks(value, max_fp8, dtype, axes):
             inverse = torch.where(amax == 0, 1.0, inverse)
         scale = inverse.reciprocal()
     else:
-        scale = torch.where(
-            amax == 0, 1.0, (max_fp8 / amax).clamp_max(torch.finfo(torch.float32).max)
-        )
-        inverse = scale.reciprocal()
+        # TE uses __fdiv_rn for max_fp8 / amax. In PyTorch, a scalar on
+        # the left of `/` rounds reciprocal and multiply separately;
+        # one ULP in the multiplier can move BF16 input across an FP8 tie.
+        scale = divided_fp32(max_fp8, amax)
+        scale = torch.where(torch.isinf(scale), torch.finfo(value.dtype).max, scale)
+        scale = torch.where(amax == 0, 1.0, scale)
+        inverse = divided_fp32(1.0, scale)
     payload = (tiles * scale).clamp(-max_fp8, max_fp8).to(dtype)
     return payload.reshape(m, k), inverse.reshape(m // m_block, k // k_block)
 
@@ -267,10 +276,26 @@ def check_list_gemm_contract(adapter):
     assert calls == [("TN", False, False)] * 2 + [("NN", True, False)] * 2 + [("NT", True, True)] * 2
 
 
+def check_fnuz_oracle_direct_division():
+    # Example from the preserved 1025-token fixture in job 756723.
+    # With scale=RNE(240/2.578125), the scaled values land exactly at
+    # -46 and 5.75; RNE picks the even FNUZ encodings of -48 and 6.
+    x = torch.zeros((1, 128), dtype=torch.bfloat16)
+    x[0, :3] = torch.tensor([2.578125, -0.494140625, 0.061767578125])
+    q, scale_inv = quant_blocks(x, 240.0, torch.float8_e4m3fnuz, (1, BLOCK))
+    assert q.view(torch.uint8)[0, :3].tolist() == [127, 236, 84]
+    assert scale_inv.item() == 0.0107421875
+    # The old operation is demonstrably different for both midpoint values.
+    legacy_scale = 240.0 / x.float().abs().amax().reshape(1, 1)
+    legacy_bytes = (x.float() * legacy_scale).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    assert legacy_bytes[0, 1:3].tolist() == [235, 83]
+
+
 def cpu_check():
     torch.set_num_threads(2)
     adapter = load_adapter()
     check_list_gemm_contract(adapter)
+    check_fnuz_oracle_direct_division()
     experts = make_raw(adapter, "cpu", 3, 128, 128)
     backend = experts._backend = ObservedBackend(CPUBackend())
     producer, consumer, consumer2 = CPUStream(), CPUStream(), CPUStream()
