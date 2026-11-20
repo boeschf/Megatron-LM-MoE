@@ -11,6 +11,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.beverin_qknorm import (
+    qknorm_fla_or_te,
+    qknorm_fla_requested,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -1519,6 +1523,8 @@ class SelfAttention(Attention):
         else:
             self.k_layernorm = None
 
+        self._qknorm_fla = qknorm_fla_requested(self.config)
+
     def run_realtime_tests(self):
         """Performs a consistency check.
 
@@ -1699,10 +1705,16 @@ class SelfAttention(Attention):
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
-            query = apply_module(self.q_layernorm)(query)
+            if self._qknorm_fla and output_gate:
+                query = qknorm_fla_or_te(self.q_layernorm, query, 28)
+            else:
+                query = apply_module(self.q_layernorm)(query)
 
         if self.k_layernorm is not None:
-            key = apply_module(self.k_layernorm)(key)
+            if self._qknorm_fla and output_gate:
+                key = qknorm_fla_or_te(self.k_layernorm, key, 7)
+            else:
+                key = apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
