@@ -10,6 +10,7 @@ The native probe requires an image PyTorch with functional HIP kernel tracing.
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -40,17 +41,21 @@ OPERATIONS = {
 LIMITS = {"y": (.018, .04), "dx": (.018, .04), "dp": (.018, .04), "dw": (.018, .04)}
 
 
-def check_error(label, actual, expected, limits):
+def error_norms(actual, expected):
     assert actual.shape == expected.shape
     if actual.numel() == 0:
         return (0.0, 0.0)
     actual, expected = actual.float(), expected.float()
-    assert torch.isfinite(actual).all() and torch.isfinite(expected).all(), label
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
     diff = actual - expected
-    norms = (
+    return (
         (diff.norm() / expected.norm().clamp_min(1e-30)).item(),
         (diff.abs().max() / expected.abs().max().clamp_min(1e-30)).item(),
     )
+
+
+def check_error(label, actual, expected, limits):
+    norms = error_norms(actual, expected)
     assert all(n <= t for n, t in zip(norms, limits)), (label, norms, limits)
     return norms
 
@@ -558,6 +563,86 @@ def native_check(device, trace_dir):
     print("resident FNUZ GPU native dispatch, FNUZ arithmetic and lifecycle: PASS")
 
 
+@torch.no_grad()
+def diagnose_skewed_fc2(device):
+    """Localize job 756614's mismatch without changing the acceptance test."""
+    from megatron.core.transformer.moe.resident_fp8 import _NativeBackend
+
+    module = make_te_experts(device, selected=True)
+    native = _NativeBackend(device)
+    x, p, _ = samples(SKEWED, WIDTH, device, 598)
+    m = x.shape[0]
+    padding = (-m) % BLOCK
+    xp = F.pad(x, (0, 0, 0, padding))
+    pp = F.pad(p, (0, padding))[:, None]
+    expert = module._resident_fp8
+    w1, w2 = expert.fc1[15], expert.fc2[15]
+    fmt = (240., torch.float8_e4m3fnuz)
+    row, square = (1, BLOCK), (BLOCK, BLOCK)
+
+    def compare(a, b):
+        return {"error_norms": error_norms(a, b), "unequal_values": int((a != b).sum())}
+
+    def gemm(op, weight, operand, width):
+        out = xp.new_empty((m + padding, width))
+        native.gemm(op, [weight], [operand], [out], layout="TN")
+        return out
+
+    def cast_report(native_q, original, axes):
+        payload, scale = quant_blocks(original, *fmt, axes)
+        # The TE storage carries typed native FNUZ plus the inverse scales.
+        # Compare the raw codes, and compare FP32 decoded values independently
+        # of the physical scale buffer's padding or layout.
+        actual = native_q._rowwise_data
+        assert actual.dtype == torch.uint8 and actual.shape == payload.shape
+        return {
+            "bit_mismatches": int((actual != payload.view(torch.uint8)).sum()),
+            "dequant": compare(native_q.dequantize(dtype=torch.float32), qdq(original, fmt, axes)),
+            "logical_scale_shape": list(scale.shape),
+        }
+
+    nx, nw1, nw2 = native.row(xp), native.weight(w1), native.weight(w2)
+    native_a = gemm("fc1_fwd", nw1, nx, 2 * FFN)
+    original_a = (qdq(xp, fmt, row) @ qdq(w1, fmt, square).T).bfloat16()
+    conditioned_a = (
+        nx.dequantize(dtype=torch.float32) @ nw1.dequantize(dtype=torch.float32).T
+    ).bfloat16()
+    native_a[m:].zero_()
+    native_s = native.activation(native_a, pp)
+    native_s[m:].zero_()
+    local_s = sssglu(native_a, pp)
+    original_s = sssglu(original_a, pp)
+    ns = native.row(native_s)
+    native_y = gemm("fc2_fwd", nw2, ns, WIDTH)
+    conditioned_y = (
+        ns.dequantize(dtype=torch.float32) @ nw2.dequantize(dtype=torch.float32).T
+    ).bfloat16()
+    original_y = (qdq(original_s, fmt, row) @ qdq(w2, fmt, square).T).bfloat16()
+    isolated_s_cast_y = (qdq(native_s, fmt, row) @ qdq(w2, fmt, square).T).bfloat16()
+    same_a_y = (qdq(local_s, fmt, row) @ qdq(w2, fmt, square).T).bfloat16()
+    combined_y, bias = module(x, torch.tensor(SKEWED), p)
+    assert bias is None
+    report = {
+        "case": "skewed expert 15",
+        "rows": m,
+        "cast_input": cast_report(nx, xp, row),
+        "cast_fc1_weight": cast_report(nw1, w1, square),
+        "cast_fc2_weight": cast_report(nw2, w2, square),
+        "fc1_vs_original": compare(native_a[:m], original_a[:m]),
+        "fc1_given_native_payloads": compare(native_a[:m], conditioned_a[:m]),
+        "sssglu_given_native_fc1": compare(native_s[:m], local_s[:m]),
+        "cast_fc2_activation": cast_report(ns, native_s, row),
+        "fc2_given_native_payloads": compare(native_y[:m], conditioned_y[:m]),
+        "fc2_given_native_activation": compare(native_y[:m], isolated_s_cast_y[:m]),
+        "fc2_with_torch_sssglu_given_native_fc1": compare(same_a_y[:m], original_y[:m]),
+        "fc2_vs_original": compare(native_y[:m], original_y[:m]),
+        "adapter_vs_explicit_native_chain": compare(combined_y, native_y[:m]),
+        "unchanged_acceptance_limits": LIMITS["y"],
+        "verdict": "diagnostic only",
+    }
+    print("FNUZ_EXPERT_ORACLE_DIAGNOSTIC", json.dumps(report, sort_keys=True), flush=True)
+
+
 def make_te_experts(device, *, selected):
     from types import SimpleNamespace
 
@@ -594,13 +679,15 @@ def make_te_experts(device, *, selected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cpu", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--cpu", action="store_true")
+    mode.add_argument("--diagnose-skewed-fc2", action="store_true")
     parser.add_argument("--trace-dir", type=Path)
     args = parser.parse_args()
     if args.cpu:
         cpu_check()
     else:
-        if args.trace_dir is None:
+        if args.trace_dir is None and not args.diagnose_skewed_fc2:
             parser.error("the gfx942 qualification requires --trace-dir (new directory)")
         if int(os.getenv("WORLD_SIZE", "1")) != 1:
             parser.error("the native expert probe is single-rank")
@@ -610,7 +697,11 @@ def main():
         sys.path.insert(0, str(SOURCE_ROOT))
         torch.cuda.set_device(local_rank)
         torch.set_float32_matmul_precision("highest")
-        native_check(torch.device("cuda", local_rank), args.trace_dir)
+        device = torch.device("cuda", local_rank)
+        if args.diagnose_skewed_fc2:
+            diagnose_skewed_fc2(device)
+        else:
+            native_check(device, args.trace_dir)
 
 
 if __name__ == "__main__":
