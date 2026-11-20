@@ -511,6 +511,92 @@ def per_token_dequant_from_fp8(
     return out
 
 
+def _require_gfx942_dispatch(tensor: torch.Tensor) -> None:
+    if (
+        torch.version.hip is None
+        or not tensor.is_cuda
+        or torch.cuda.get_device_properties(tensor.device).gcnArchName.split(":")[0] != "gfx942"
+    ):
+        raise ValueError("Native E4M3FNUZ dispatch requires a ROCm gfx942 device")
+    # Do not let Triton's arch override select software lowering for another ISA.
+    if triton.knobs.runtime.override_arch not in (None, "gfx942"):
+        raise ValueError("Native E4M3FNUZ dispatch cannot override the gfx942 Triton target")
+
+
+@triton.jit
+def _cast_dispatch_fnuz_kernel(
+    x, payload, scales, m, stride_m, GROUPS: tl.constexpr, BLOCK_M: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    group = tl.program_id(1)
+    cols = group * 128 + tl.arange(0, 128)
+    mask = rows[:, None] < m
+    values = tl.load(x + rows[:, None] * stride_m + cols[None, :], mask, other=0)
+    # BF16 magnitude bits are ordered even for subnormals, with Inf/NaN above
+    # every finite number. In particular a tiny nonzero block isn't a zero block.
+    abs_bits = values.to(tl.uint16, bitcast=True) & 0x7FFF
+    amax_bits = tl.max(abs_bits, axis=1)
+    amax = (amax_bits.to(tl.uint32) << 16).to(tl.float32, bitcast=True)
+    sf = tl.where(amax_bits == 0, 1.0, tl.maximum(tl.div_rn(amax, 240.0), 1.0e-30))
+    # Poison nonfinite blocks rather than passing off clipped/zero data as valid.
+    sf = tl.where(amax_bits < 0x7F80, sf, float("nan"))
+    inv_sf = tl.div_rn(1.0, sf)
+    scaled = values.to(tl.float32) * inv_sf[:, None]
+    scaled = tl.clamp(scaled, -240.0, 240.0, propagate_nan=tl.PropagateNan.ALL)
+    # Image 910 Triton maps torch.float8_e4m3fnuz pointers to fp8e4b8 (CDNA3).
+    encoded = scaled.to(tl.float8e4b8, fp_downcast_rounding="rtne")
+    tl.store(payload + rows[:, None] * (GROUPS * 128) + cols[None, :], encoded, mask)
+    tl.store(scales + rows * GROUPS + group, sf, rows < m)
+
+
+def cast_dispatch_fnuz(
+    x: torch.Tensor, *, use_ue8m0: bool = False, use_packed_ue8m0: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16 for native gfx942 dispatch: 128 columns per scale, unpacked FP32."""
+    if use_ue8m0 or use_packed_ue8m0:
+        raise ValueError("Native E4M3FNUZ dispatch does not support UE8M0 scales")
+    if x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] == 0 or x.shape[1] % 128:
+        raise ValueError("Native E4M3FNUZ dispatch requires 2D BF16, width a positive multiple of 128")
+    _require_gfx942_dispatch(x)
+    if x.stride(1) != 1:
+        x = x.contiguous()
+    m, n = x.shape
+    groups = n // 128
+    payload = torch.empty((m, n), dtype=torch.float8_e4m3fnuz, device=x.device)
+    scales = torch.empty((m, groups), dtype=torch.float32, device=x.device)
+    if m:
+        _cast_dispatch_fnuz_kernel[(triton.cdiv(m, 4), groups)](
+            x, payload, scales, m, x.stride(0), GROUPS=groups, BLOCK_M=4, allow_flush_denorm=False
+        )
+    return payload, scales
+
+
+def dequant_dispatch_fnuz(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode actual native FNUZ receive storage directly to BF16, including empty rows."""
+    if payload.dtype != torch.float8_e4m3fnuz or payload.ndim != 2:
+        raise ValueError("Native E4M3FNUZ dispatch decode requires a 2D FNUZ payload")
+    m, n = payload.shape
+    if (
+        n == 0
+        or n % 128
+        or payload.stride(1) != 1
+        or scales.dtype != torch.float32
+        or scales.device != payload.device
+        or scales.shape != (m, n // 128)
+    ):
+        raise ValueError("Native E4M3FNUZ dispatch decode requires unpacked FP32 scales per 128 features")
+    _require_gfx942_dispatch(payload)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=payload.device)
+    if m:
+        # The kernel reads a typed fp8e4b8 pointer for FNUZ, never an FN view.
+        _per_token_dequant_from_fp8_kernel[(triton.cdiv(m, 4), n // 128)](
+            payload, scales, out, m, n, payload.stride(0), scales.stride(0),
+            scales.stride(1), out.stride(0), BLOCK_M=4, gran_k=128,
+            allow_flush_denorm=False,
+        )
+    return out
+
+
 @torch._dynamo.allow_in_graph
 def per_token_dequant_from_fp8_chunked(
     x_fp8: torch.Tensor,

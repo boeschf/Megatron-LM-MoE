@@ -66,6 +66,22 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     return _buffer
 
 
+def _validate_fnuz_wire(payload: torch.Tensor, scales: torch.Tensor) -> None:
+    if (
+        payload.dtype != torch.float8_e4m3fnuz
+        or payload.ndim != 2
+        or payload.size(1) == 0
+        or payload.size(1) % 128
+        or not payload.is_contiguous()
+        or scales is None
+        or scales.dtype != torch.float32
+        or scales.shape != (payload.size(0), payload.size(1) // 128)
+        or scales.device != payload.device
+        or not scales.is_contiguous()
+    ):
+        raise ValueError("Expected contiguous FNUZ dispatch payload and one FP32 scale per 128 features")
+
+
 class FusedDispatch(torch.autograd.Function):
     """Fused dispatch operation for MoE routing combining computation and communication."""
 
@@ -277,6 +293,9 @@ if HAVE_DEEP_EP:
             (recv_x_fp8, recv_x_sf, recv_token_indices, recv_token_probs,
              num_recv_tokens_per_expert_list, handle)
         """
+        is_fnuz = x_fp8.dtype == getattr(torch, "float8_e4m3fnuz", None)
+        if is_fnuz:
+            _validate_fnuz_wire(x_fp8, x_sf)
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
@@ -320,6 +339,8 @@ if HAVE_DEEP_EP:
             after_event_overlap.current_stream_wait()
 
         recv_x_fp8, recv_x_sf = recv_x
+        if is_fnuz:
+            _validate_fnuz_wire(recv_x_fp8, recv_x_sf)
         # Match FusedDispatch.forward: tokens_per_expert is consumed downstream as a tensor.
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
         return (

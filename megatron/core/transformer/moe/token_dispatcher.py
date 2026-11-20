@@ -1646,6 +1646,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens, scale factor (or None), and probabilities.
         """
+        if getattr(self.config, "moe_fp8_dispatch_fnuz", False) and (
+            hidden_states_sf is None or hidden_states.dtype != torch.float8_e4m3fnuz
+        ):
+            raise ValueError("Native E4M3FNUZ dispatch requires the scheduled FNUZ payload and scales")
         if hidden_states_sf is not None:
             recv_x_fp8, recv_x_sf = self._comm_manager.fp8_dispatch(
                 hidden_states, hidden_states_sf, async_finish, allocate_on_comm_stream
@@ -1703,6 +1707,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             Combined tokens after fused un-permutation and communication.
         """
+        if (
+            getattr(self.config, "moe_fp8_dispatch_fnuz", False)
+            and hidden_states.dtype != torch.bfloat16
+        ):
+            raise ValueError("Native E4M3FNUZ dispatch requires BF16 combine")
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):

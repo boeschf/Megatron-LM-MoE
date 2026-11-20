@@ -352,6 +352,59 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
+        self._resident_fp8 = None
+        if getattr(config, "moe_resident_fp8_fnuz", False):
+            from megatron.core.transformer.moe.resident_fp8 import ResidentFP8Experts
+
+            if (
+                not HAVE_TE
+                or config.fp8
+                or config.fp4
+                or config.add_bias_linear
+                or self.activation_func is not sssglu_act
+                or not config.gated_linear_unit
+                or config.glu_linear_offset != 0.0
+                or config.activation_func_clamp_value is not None
+                or config.moe_apply_probs_on_input
+                or config.use_te_activation_func
+                or self.tp_group.size() != 1
+                or config.use_cpu_initialization
+                or config.init_model_with_meta_device
+                or self.offload_expert_fc1
+                or self.offload_moe_act
+                or self.activation_recompute
+                or not config.delay_wgrad_compute
+                or config.pnglu
+                or config.pn3glu
+                or config.gxpr
+                or config.gxpry
+                or config.gxprv2
+                or config.gxr2
+                or config.xr2glu
+                or config.xssglu
+            ):
+                raise ValueError(
+                    "Resident FNUZ experts require delayed-wgrad, bias-free, "
+                    "unmodified SSSGLU with expert TP=1, GPU initialization, no global FP8/FP4, "
+                    "expert activation offload or moe_act recomputation"
+                )
+            self._resident_fp8 = ResidentFP8Experts(
+                [getattr(self.linear_fc1, f"weight{i}") for i in range(num_local_experts)],
+                [getattr(self.linear_fc2, f"weight{i}") for i in range(num_local_experts)],
+            )
+            self.register_load_state_dict_pre_hook(self._invalidate_resident_fp8_weights)
+
+    def _invalidate_resident_fp8_weights(self, module, state_dict, prefix, local_metadata, *args):
+        if local_metadata.get("assign_to_params_buffers", False):
+            raise RuntimeError("Restore resident FNUZ experts in place to preserve parameter IDs")
+        self._resident_fp8.clear_weight_cache()
+
+    def register_resident_fp8_main_grad_ready(self, param, hook_fn):
+        """Register a main-grad ready callback on a selected resident expert weight."""
+        if self._resident_fp8 is None:
+            raise RuntimeError("This TEGroupedMLP does not own resident FNUZ weights")
+        self._resident_fp8.register_main_grad_ready(param, hook_fn)
+
     @staticmethod
     def _zero_fp8_padding_rows(hidden_states, probs, actual_tokens_per_expert, padded_tokens_per_expert):
         """Zero the FP8-padding rows that TE's Fp8Padding leaves uninitialized.
@@ -599,6 +652,14 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        if self._resident_fp8 is not None:
+            return (
+                self._resident_fp8(
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                ),
+                None,
+            )
+
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -755,6 +816,9 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
+        if self._resident_fp8 is not None:
+            self._resident_fp8.drain()
+            return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
 
