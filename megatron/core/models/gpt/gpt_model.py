@@ -17,6 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.gpt.chunked_lm_head import chunked_lm_head_loss
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -678,6 +679,27 @@ class GPTModel(LanguageModule):
                 # then back to [S’, B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if self.config.lm_head_token_chunk_size and self.training and labels is not None:
+            if (
+                self.share_embeddings_and_output_weights
+                or self.output_layer.bias is not None
+                or self.pg_collection.tp.size() != 1
+                or output_logit_logging.is_active()
+                or has_config_logger_enabled(self.config)
+                or is_using_quantization_scales(self.config)
+            ):
+                raise ValueError(
+                    "Chunked LM head requires untied, bias-free, unquantized TP1 output "
+                    "without logit logging"
+                )
+            return chunked_lm_head_loss(
+                hidden_states.contiguous(),
+                self.output_layer.weight,
+                labels,
+                self.compute_language_model_loss,
+                self.config.lm_head_token_chunk_size,
+            )
 
         if self.training and labels is not None:
             output_logit_logging.record_hidden(

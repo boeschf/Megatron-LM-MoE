@@ -1473,12 +1473,35 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    lm_head_token_chunk_size: int = 0
+    """Bound training output/CE logits to this many token positions per rank, or 0 to disable."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+
+        if self.lm_head_token_chunk_size and (
+            not 0 < self.lm_head_token_chunk_size <= 512
+            or self.tensor_model_parallel_size != 1
+            or self.sequence_parallel
+            or not self.bf16
+            or self.fp32_residual_connection
+            or self.fp8 is not None
+            or self.fp4 is not None
+            or self.use_mup
+            or self.mtp_num_layers
+            or self.cuda_graph_impl != "none"
+            or self.gradient_accumulation_fusion
+            or self.defer_embedding_wgrad_compute
+            or self.cpu_offloading
+            or self.fine_grained_activation_offloading
+            or not self.cross_entropy_loss_fusion
+            or self.cross_entropy_fusion_impl != "native"
+        ):
+            raise ValueError("Chunked LM head requires the eager TP1 BF16 native fused CE path")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
