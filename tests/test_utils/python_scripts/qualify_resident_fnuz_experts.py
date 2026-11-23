@@ -501,6 +501,7 @@ def prove_native_replay(experts, native, device, trace_dir):
     names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
     assert_native_names(names, 1, "__hip_bfloat16", REPLAY_OP)
     torch.testing.assert_close(native.decode_row(recomputed), reference, rtol=0, atol=0)
+    print(f"{REPLAY_OP}: 1 native FNUZ kernel launch, exact padded operand passed", flush=True)
 
 
 def check_replay_retention(device):
@@ -558,12 +559,14 @@ def native_check(device, trace_dir, *, replay=False):
     del baseline
 
     experts = module._resident_fp8
-    native = _NativeBackend(device)
-    backend = experts._backend = ObservedBackend(native)
+    native = experts._backend = _NativeBackend(device)
     codec_check(native, device)
     prove_native_dispatch(native, device, trace_dir)
     if replay:
         prove_native_replay(experts, native, device, trace_dir)
+    # The replay trace calls the real adapter helper. Count only the
+    # lifecycle workload, not the preceding standalone fixtures.
+    backend = experts._backend = ObservedBackend(native)
     base = torch.cuda.current_stream(device)
     producer = torch.cuda.Stream(device=device)
     consumers = [torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)]
