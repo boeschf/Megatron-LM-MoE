@@ -163,6 +163,9 @@ def initialize_megatron(
         # Megatron's MPU is the master. Complete initialization right away.
         finish_mpu_init()
 
+        from megatron.training.comm_warmup import warmup
+        warmup(args)
+
         # Autoresume.
         _init_autoresume()
 

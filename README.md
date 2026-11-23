@@ -76,6 +76,14 @@ For NGC container setup and all installation options, see the **[Installation Gu
 - **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
 - **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
+### Optional communicator initialization
+
+Set `MEGATRON_COMM_WARMUP=1` on every rank to initialize existing NCCL process groups and both batched and unbatched pipeline peers before model allocation.
+The default is disabled, and the hook applies only to immediate model-parallel initialization, not `--lazy-mpu-init`.
+Warmup uses deterministic scratch tensors without consuming random numbers or changing model, optimizer or pipeline settings.
+It does not initialize DeepEP/UCCL token dispatch or qualify concurrent expert execution.
+This startup-only candidate has not yet been GPU-qualified on GH200.
+
 # Latest News
 
 - **[2026/03]** **Deprecating Python 3.10 support:** We're officially dropping Python 3.10 support with the upcoming 0.17.0 release. Downstream applications must raise their lower boundary to 3.12 to stay compatible with MCore.
