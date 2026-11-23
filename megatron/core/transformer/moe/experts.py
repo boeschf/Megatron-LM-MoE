@@ -391,6 +391,7 @@ class TEGroupedMLP(MegatronModule):
             self._resident_fp8 = ResidentFP8Experts(
                 [getattr(self.linear_fc1, f"weight{i}") for i in range(num_local_experts)],
                 [getattr(self.linear_fc2, f"weight{i}") for i in range(num_local_experts)],
+                recompute_fc1=config.moe_resident_fp8_fnuz_recompute_fc1,
             )
             self.register_load_state_dict_pre_hook(self._invalidate_resident_fp8_weights)
 

@@ -141,10 +141,11 @@ class ResidentFP8Experts:
     matched by one backward and one drain (also for zero rows).
     """
 
-    def __init__(self, fc1, fc2):
+    def __init__(self, fc1, fc2, *, recompute_fc1=False):
         self.fc1 = tuple(fc1)
         self.fc2 = tuple(fc2)
         self.params = self.fc1 + self.fc2
+        self._recompute_fc1 = recompute_fc1
         if not self.fc1 or len(self.fc1) != len(self.fc2):
             raise ValueError("Expected one FC1 and FC2 weight per resident expert")
         if len(set(self.params)) != len(self.params):
@@ -300,10 +301,19 @@ class ResidentFP8Experts:
         backend.gemm("fc2_fwd", [w[1] for w in weights], sq, y, layout="TN")
         if training_backward:
             ctx.save_for_backward(probs)
-            ctx.saved_rows = (xq, [backend.row(v) for v in a])
+            ctx.saved_rows = (xq, None if self._recompute_fc1 else [backend.row(v) for v in a])
             ctx.version = version
             self._outstanding += 1
         return self._join(y, groups, x, self.width)
+
+    def _replay_fc1(self, group, weight, xq, like):
+        """Recreate one expert's saved operand without retaining the BF16 preactivation."""
+        backend = self._backend
+        a = like.new_empty((group.padded, 2 * self.ffn))
+        # The pinned TE list route launches one native GEMM per expert. Match
+        # the original forward flags, operands and padded-tail handling.
+        backend.gemm("fc1_recompute_fwd", [weight], [xq], [a], layout="TN")
+        return backend.row(self._zero_tail(a, group))
 
     @torch.no_grad()
     def _backward(self, ctx, dy):
@@ -329,14 +339,18 @@ class ResidentFP8Experts:
         )
         dp = torch.empty_like(probs)
         da, sb_col = [], []
-        for g, value, d_s in zip(groups, aq, ds):
+        for i, (g, d_s) in enumerate(zip(groups, ds)):
             p = g.pad(probs).unsqueeze(-1)
+            value = self._replay_fc1(g, weights[i][0], xq[i], dy) if aq is None else aq[i]
+            # Preserve the saved-path BF16 -> rowwise FNUZ -> BF16 boundary.
             a_b = self._zero_tail(backend.decode_row(value), g)
+            del value
             d_a, d_p = backend.activation_backward(self._zero_tail(d_s, g), a_b, p)
             dp[g.start : g.start + g.count].copy_(d_p[: g.count])
             da.append(self._zero_tail(d_a, g))
             # Do not use forward S: it came from FC1's unquantized BF16 A.
             sb_col.append(backend.column(self._zero_tail(backend.activation(a_b, p), g)))
+            del a_b
 
         dx = self._destinations(groups, dy, self.width)
         backend.gemm(

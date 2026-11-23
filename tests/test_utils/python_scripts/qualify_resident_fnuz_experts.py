@@ -39,6 +39,8 @@ OPERATIONS = {
 # recipe bounds, not FN parity bounds. Full-chain includes quantization of
 # intermediate results; FP32 accumulation is also tested directly below.
 LIMITS = {"y": (.018, .04), "dx": (.018, .04), "dp": (.018, .04), "dw": (.018, .04)}
+REPLAY_OP = "fc1_recompute_fwd"
+MIN_RETAINED_SAVING = 450 * 2**20
 
 
 def error_norms(actual, expected):
@@ -169,12 +171,13 @@ class ObservedBackend:
     def gemm(self, operation, a, b, out, *, layout, accumulate=False):
         if out:
             self.calls[operation] += len(out)
-            assert (layout, out[0].dtype) == OPERATIONS[operation]
+            assert (layout, out[0].dtype) == OPERATIONS.get(operation, OPERATIONS["fc1_fwd"])
+            assert operation in OPERATIONS or (operation == REPLAY_OP and len(out) == 1)
             assert accumulate == operation.endswith("_wgrad")
         return self.backend.gemm(operation, a, b, out, layout=layout, accumulate=accumulate)
 
 
-def make_raw(adapter, device, n_experts, width, ffn):
+def make_raw(adapter, device, n_experts, width, ffn, *, replay=False):
     generator = torch.Generator().manual_seed(42158)
     params = [
         [
@@ -185,7 +188,7 @@ def make_raw(adapter, device, n_experts, width, ffn):
         ]
         for shape in ((2 * ffn, width), (width, ffn))
     ]
-    return adapter.ResidentFP8Experts(*params)
+    return adapter.ResidentFP8Experts(*params, recompute_fc1=replay)
 
 
 def samples(splits, width, device, seed):
@@ -271,9 +274,10 @@ def check_list_gemm_contract(adapter):
         calls.append((options["layout"], options["grad"], options["accumulate"]))
 
     backend._grouped = grouped
-    for op, (layout, _) in OPERATIONS.items():
+    for op, (layout, _) in {**OPERATIONS, REPLAY_OP: OPERATIONS["fc1_fwd"]}.items():
         backend.gemm(op, a, b, out, layout=layout, accumulate=(layout == "NT"))
-    assert calls == [("TN", False, False)] * 2 + [("NN", True, False)] * 2 + [("NT", True, True)] * 2
+    assert calls == ([("TN", False, False)] * 2 + [("NN", True, False)] * 2
+                     + [("NT", True, True)] * 2 + [("TN", False, False)])
 
 
 def check_fnuz_oracle_direct_division():
@@ -299,12 +303,12 @@ def check_empty_drain_snapshots(snapshots, count):
         assert torch.equal(after, before), f"empty drain changed snapshot {position}"
 
 
-def cpu_check():
+def cpu_check(*, replay=False):
     torch.set_num_threads(2)
     adapter = load_adapter()
     check_list_gemm_contract(adapter)
     check_fnuz_oracle_direct_division()
-    experts = make_raw(adapter, "cpu", 3, 128, 128)
+    experts = make_raw(adapter, "cpu", 3, 128, 128, replay=replay)
     backend = experts._backend = ObservedBackend(CPUBackend())
     producer, consumer, consumer2 = CPUStream(), CPUStream(), CPUStream()
     notified = []
@@ -323,11 +327,15 @@ def cpu_check():
         for i, splits in enumerate(cases):
             x, p, dy = samples(splits, 128, "cpu", 10 + i)
             y = experts(x, splits, p)
+            assert (y.grad_fn.saved_rows[1] is None) == replay
             products.append((x, p, y, dy))
+        assert backend.casts["row"] == (4 if replay else 6)
+        assert REPLAY_OP not in backend.calls
         expect_error(experts.clear_weight_cache, "undrained")
         for x, p, y, dy in products:
             y.backward(dy)
             assert x.grad.shape == x.shape and p.grad.shape == p.shape
+            assert y.grad_fn.saved_rows is None
         x, p, y, dy = products[0]
         references = []
         for i, sl in ((0, slice(0, 1)), (2, slice(1, 130))):
@@ -367,6 +375,10 @@ def cpu_check():
         snapshots.extend(p.main_grad.clone() for p in drain_order)
         check_empty_drain_snapshots(snapshots, len(drain_order))
         assert experts._outstanding == 0 and set(backend.calls.values()) == {2}
+        expected_calls = {name: 2 for name in OPERATIONS}
+        if replay:
+            expected_calls[REPLAY_OP] = 2
+        assert backend.calls == expected_calls
         assert backend.casts == {"weight": 4, "row": 10, "column": 8}
         expect_error(experts.drain, "no completed backward")
 
@@ -381,8 +393,10 @@ def cpu_check():
             assert backend.casts["weight"] == 8 and not torch.equal(y, refreshed)
         y = experts(x, cases[0], p)
         torch.autograd.graph.increment_version(experts.fc2[0])
+        replay_calls = backend.calls[REPLAY_OP]
         expect_error(lambda: y.backward(torch.ones_like(y)), "changed between forward and backward")
-    print("resident FNUZ CPU lifecycle: PASS (software GEMMs and simulated streams)")
+        assert backend.calls[REPLAY_OP] == replay_calls
+    print(f"resident FNUZ CPU lifecycle, replay={replay}: PASS (software GEMMs and simulated streams)")
 
 
 def codec_check(backend, device):
@@ -467,10 +481,73 @@ def prove_native_dispatch(backend, device, trace_dir):
         print(f"{operation}: 2 native FNUZ kernel launches, exact fixture passed")
 
 
-def native_check(device, trace_dir):
+@torch.no_grad()
+def prove_native_replay(experts, native, device, trace_dir):
+    """Trace the actual replay helper and compare with a padded saved-path operand."""
+    from megatron.core.transformer.moe.resident_fp8 import _Rows
+
+    group = _Rows(0, 0, 129)
+    x, _, _ = samples((group.count,), WIDTH, device, 891)
+    xq = native.row(group.pad(x))
+    weight = native.weight(experts.fc1[0].detach())
+    a = x.new_empty((group.padded, 2 * FFN))
+    native.gemm("fc1_fwd", [weight], [xq], [a], layout="TN")
+    reference = native.decode_row(native.row(experts._zero_tail(a, group)))
+    torch.cuda.synchronize(device)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        recomputed = experts._replay_fc1(group, weight, xq, x)
+        torch.cuda.synchronize(device)
+    prof.export_chrome_trace(str(trace_dir / f"{REPLAY_OP}.json"))
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    assert_native_names(names, 1, "__hip_bfloat16", REPLAY_OP)
+    torch.testing.assert_close(native.decode_row(recomputed), reference, rtol=0, atol=0)
+
+
+def check_replay_retention(device):
+    """Measure retained Torch bytes after two full-size, balanced expert forwards."""
+    splits = (4096,) * 16  # 8192 tokens/rank * top-8, balanced routing.
+    counts = torch.tensor(splits)
+    retained = []
+    for replay in (False, True):
+        module = make_te_experts(device, selected=True, replay=replay)
+        experts = module._resident_fp8
+        for param in experts.params:
+            param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        batches = [samples(splits, WIDTH, device, seed) for seed in (64, 65)]
+        # Populate the same expert weight generation before the measured window.
+        with torch.no_grad():
+            module(batches[0][0][:16], torch.ones(16, dtype=torch.long), batches[0][1][:16])
+        torch.cuda.synchronize(device)
+        baseline = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        outputs = [module(x, counts, p)[0] for x, p, _ in batches]
+        torch.cuda.synchronize(device)
+        retained.append(torch.cuda.memory_allocated(device) - baseline)
+        assert all((y.grad_fn.saved_rows[1] is None) == replay for y in outputs)
+        forward_peak = torch.cuda.max_memory_allocated(device) - baseline
+        for (x, p, dy), y in reversed(list(zip(batches, outputs, strict=True))):
+            y.backward(dy)
+            module.backward_dw()
+            assert y.grad_fn.saved_rows is None
+            assert all(torch.isfinite(v).all() for v in (y, x.grad, p.grad))
+        torch.cuda.synchronize(device)
+        assert experts._outstanding == 0 and not experts._pending
+        assert all(param.grad is None and torch.isfinite(param.main_grad).all()
+                   for param in experts.params)
+        print(json.dumps(dict(replay=replay, retained_bytes=retained[-1],
+                              forward_peak_bytes=forward_peak,
+                              total_peak_bytes=torch.cuda.max_memory_allocated(device) - baseline)),
+              flush=True)
+        del module, experts, batches, outputs, param, x, p, dy, y
+    assert retained[0] - retained[1] >= MIN_RETAINED_SAVING, retained
+    print(f"FC1 replay retained Torch allocation reduction: {retained[0] - retained[1]} bytes",
+          flush=True)
+
+
+def native_check(device, trace_dir, *, replay=False):
     from megatron.core.transformer.moe.resident_fp8 import _NativeBackend
 
-    module = make_te_experts(device, selected=True)
+    module = make_te_experts(device, selected=True, replay=replay)
     baseline = make_te_experts(device, selected=False)
     assert list(module.state_dict()) == list(baseline.state_dict())
     for (name, param), (ref_name, ref_param) in zip(
@@ -485,6 +562,8 @@ def native_check(device, trace_dir):
     backend = experts._backend = ObservedBackend(native)
     codec_check(native, device)
     prove_native_dispatch(native, device, trace_dir)
+    if replay:
+        prove_native_replay(experts, native, device, trace_dir)
     base = torch.cuda.current_stream(device)
     producer = torch.cuda.Stream(device=device)
     consumers = [torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)]
@@ -519,6 +598,7 @@ def native_check(device, trace_dir):
         with torch.cuda.stream(producer):
             y, bias = module(x, divisions, p)
             assert bias is None and y.dtype == torch.bfloat16
+            assert (y.grad_fn.saved_rows[1] is None) == replay
         products.append((splits, x, p, dy, y))
     assert backend.casts["weight"] == 12  # six active experts, each cached once
     fn_deltas = []
@@ -574,7 +654,10 @@ def native_check(device, trace_dir):
             )
             observed_errors.setdefault("dw", []).append(error)
     assert len(ready) == 3 * len(experts.params) and experts._outstanding == 0
-    assert backend.calls == {name: n_active for name in OPERATIONS}
+    expected_calls = {name: n_active for name in OPERATIONS}
+    if replay:
+        expected_calls[REPLAY_OP] = n_active
+    assert backend.calls == expected_calls
     expect_error(module.backward_dw, "no completed backward")
 
     # Simulate optimizer p.data write + explicit version seal and then restore
@@ -678,7 +761,7 @@ def diagnose_skewed_fc2(device):
     print("FNUZ_EXPERT_ORACLE_DIAGNOSTIC", json.dumps(report, sort_keys=True), flush=True)
 
 
-def make_te_experts(device, *, selected):
+def make_te_experts(device, *, selected, replay=False):
     from types import SimpleNamespace
 
     from megatron.core.activations import sssglu_act
@@ -700,6 +783,7 @@ def make_te_experts(device, *, selected):
     # validation and the distributed schedule; no alternate expert class.
     config.delay_wgrad_compute = True
     config.moe_resident_fp8_fnuz = selected
+    config.moe_resident_fp8_fnuz_recompute_fc1 = replay
     group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
     module = TEGroupedMLP(
         16, config, GroupedMLPSubmodules(TEColumnParallelGroupedLinear, TERowParallelGroupedLinear),
@@ -718,9 +802,10 @@ def main():
     mode.add_argument("--cpu", action="store_true")
     mode.add_argument("--diagnose-skewed-fc2", action="store_true")
     parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--recompute-fc1", action="store_true")
     args = parser.parse_args()
     if args.cpu:
-        cpu_check()
+        cpu_check(replay=args.recompute_fc1)
     else:
         if args.trace_dir is None and not args.diagnose_skewed_fc2:
             parser.error("the gfx942 qualification requires --trace-dir (new directory)")
@@ -736,7 +821,10 @@ def main():
         if args.diagnose_skewed_fc2:
             diagnose_skewed_fc2(device)
         else:
-            native_check(device, args.trace_dir)
+            native_check(device, args.trace_dir, replay=args.recompute_fc1)
+            if args.recompute_fc1:
+                check_replay_retention(device)
+                print("resident FNUZ native FC1 replay and retained allocation: PASS", flush=True)
 
 
 if __name__ == "__main__":

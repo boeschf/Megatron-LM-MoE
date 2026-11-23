@@ -1099,6 +1099,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_resident_fp8_fnuz: bool = False
     """Use native gfx942 blockwise E4M3FNUZ GEMMs for resident routed SSSGLU experts."""
 
+    moe_resident_fp8_fnuz_recompute_fc1: bool = False
+    """Replay resident native FC1 in backward instead of retaining its quantized preactivation."""
+
     moe_use_fp8_activation: bool = False
     """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
     be quantized into FP8 for storage."""
@@ -1987,6 +1990,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.cuda_graph_impl != "none":
                 raise ValueError("Native FNUZ dispatch graph capture is not yet qualified.")
+
+        if self.moe_resident_fp8_fnuz_recompute_fc1 and not self.moe_resident_fp8_fnuz:
+            raise ValueError("FC1 replay requires resident FNUZ experts.")
 
         if self.moe_resident_fp8_fnuz:
             from megatron.core.activations import sssglu_act
