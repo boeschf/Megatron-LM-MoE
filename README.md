@@ -98,6 +98,24 @@ This warms only the selected KDA weight-gradient paths, not every GEMM, expert k
 Initialized CUDA process state cannot be transferred through a separately warmed compiler cache.
 The new hook still requires distributed GPU qualification before reference performance is measured.
 
+### Optional TE MoE permutation initialization
+
+Set `MEGATRON_MOE_PERMUTATION_WARMUP=1` on every rank to initialize the pinned CUDA TE Triton mask-permutation forward/backward paths after model/optimizer construction and before EP overlap.
+The default is disabled.
+The hook supports BF16 activations and FP32 probabilities, TP1/CP1 without sequence parallelism, fused `flex/deepep` dispatch and the selected non-padding TE consumer.
+It uses only private tensors, with no model calls, optimizer/router access, or random-number operations.
+It covers row-map workspace bins up to `seq_length * micro_batch_size * expert_model_parallel_size`, and the one/divisible-by-16/other scalar specializations of input rows and output capacity.
+Overallocated output rows are never read; private zero-gradient backwards initialize both probability-gradient permutation and token unpermutation paths.
+CUDA completion precedes scratch release, and a final world barrier precedes training.
+
+Native TE permutation autotuning synchronizes the device, so it also runs before overlap.
+The first private case uses `seq_length * micro_batch_size * min(router_topk, EP)` rows: 65536 for Chonk's MBS2/S4096/EP16/top8 configuration.
+This is a declared saturating component proxy, not the actual deduplicated received-row count.
+Its native-autotuner choices may differ from tuning on the first real routed batch; per-rank logs retain the proxy, coverage cases and selected configurations.
+Architecture, mathematical operations and native training flags are unchanged, but this startup kernel-selection deviation must accompany performance results.
+Other kernel families, zero-token UCCL behavior, full-model fit, graph replay and checkpoint/restart remain separate qualification requirements.
+Run the isolated CPU coverage/refusal checks with `python tests/unit_tests/test_moe_permutation_warmup.py`.
+
 # Latest News
 
 - **[2026/03]** **Deprecating Python 3.10 support:** We're officially dropping Python 3.10 support with the upcoming 0.17.0 release. Downstream applications must raise their lower boundary to 3.12 to stay compatible with MCore.

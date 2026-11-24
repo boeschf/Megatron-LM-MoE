@@ -1135,6 +1135,8 @@ def pretrain(
     # Complete targeted GEMM initialization before the first overlapped schedule.
     from megatron.training import kda_wgrad_warmup
     kda_wgrad_warmup.warmup(model, args)
+    from megatron.training import moe_permutation_warmup
+    moe_permutation_warmup.warmup(args)
 
     # register state save/restore functions in rerun state machine
     rerun_state_machine = get_rerun_state_machine()
