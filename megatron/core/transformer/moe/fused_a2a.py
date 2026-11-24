@@ -206,12 +206,14 @@ class FusedCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, previous_event=None):
         """Backward pass of fused combine."""
+        # Fence the actual send tensor, including a copy for strided gradients.
+        grad_output = grad_output.contiguous()
         previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         grad_x, _, _, _, _, after_event = buffer.dispatch(
-            grad_output.contiguous(),
+            grad_output,
             handle=ctx.handle,
             previous_event=previous_event,
             async_finish=ctx.async_finish,

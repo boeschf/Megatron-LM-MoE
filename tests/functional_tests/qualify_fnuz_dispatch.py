@@ -196,7 +196,7 @@ def transport_identity():
             "extension_sha256": digest(extension), "patches": PATCHES}
 
 
-def ep16(torch, device, rank, record):
+def ep16(torch, device, rank, record, check_readiness=False):
     """Exercise real scheduled quant/dispatch/dequant nodes and two outstanding handles."""
     from megatron.core.models.gpt.fine_grained_callables import (
         ManualGradNode, build_fp8_dispatch_node_callables, build_transformer_layer_callables,
@@ -343,8 +343,36 @@ def ep16(torch, device, rank, record):
     def backward(case):
         width, epoch = case.summary["width"], case.summary["epoch"]
         print(f"FNUZ_TRANSPORT_CASE backward width={width} epoch={epoch} rank={rank}", flush=True)
-        (combine_grad,) = torch.autograd.grad(case.combined, case.combine_input,
-                                              token_signal(torch, keys, width, EP))
+        grad_output = token_signal(torch, keys, width, EP)
+        if check_readiness:
+            # Both layouts contain the identical BF16 oracle. The first handle
+            # is consumed only after a second microbatch has a live handle.
+            strided = epoch == 0
+            if strided:
+                grad_output = grad_output.T.contiguous().T
+            seen = []
+
+            original = fused_a2a.FusedCombine.__dict__["backward"]
+
+            def observe_backward(ctx, grad, *args, **kwargs):
+                assert grad.dtype == torch.bfloat16 and grad.shape == grad_output.shape
+                assert grad.is_contiguous() is not strided
+                assert torch.cuda.current_stream() == comm
+                assert ctx.handle is case.state.dispatch_handle and ctx.async_finish
+                seen.append(grad.is_contiguous())
+                return original.__func__(ctx, grad, *args, **kwargs)
+
+            comm.wait_stream(torch.cuda.current_stream())
+            fused_a2a.FusedCombine.backward = staticmethod(observe_backward)
+            try:
+                with torch.cuda.stream(comm):
+                    (combine_grad,) = torch.autograd.grad(case.combined, case.combine_input, grad_output)
+            finally:
+                fused_a2a.FusedCombine.backward = original
+            assert seen == [not strided]
+            case.summary["combine_grad_layout"] = "strided" if strided else "contiguous"
+        else:
+            (combine_grad,) = torch.autograd.grad(case.combined, case.combine_input, grad_output)
         torch.cuda.current_stream().wait_stream(comm)
         equal(torch, combine_grad, token_signal(torch, case.recv_key, width, EP), "cached BF16 dispatch")
         case.decode.event.record()
@@ -379,7 +407,7 @@ def ep16(torch, device, rank, record):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("codec", "ep16"))
+    parser.add_argument("phase", choices=("codec", "ep16", "ep16-ready-order"))
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
     local = int(os.environ["LOCAL_RANK"])
@@ -393,11 +421,11 @@ def main():
         if not __debug__:
             raise RuntimeError("Run FNUZ qualification without Python optimization")
         assert (args.phase == "codec" and world == 1 and rank == 0) or (
-            args.phase == "ep16" and world == EP and rank == 4 * node + local
+            args.phase in ("ep16", "ep16-ready-order") and world == EP and rank == 4 * node + local
             and 0 <= local < 4 and 0 <= node < 4
         )
         assert torch.version.hip and 0 <= local < torch.cuda.device_count()
-        if args.phase == "ep16":
+        if args.phase != "codec":
             assert torch.cuda.device_count() == 4
         torch.cuda.set_device(local)
         device = torch.device("cuda", local)
@@ -413,7 +441,7 @@ def main():
             assert not any(k in os.environ for k in ("UCCL_EP_DISPATCH_CONFIG", "UCCL_EP_COMBINE_CONFIG", "EFA_HOME"))
             record["environment"] = {k: v for k, v in os.environ.items() if k.startswith(("UCCL_", "FI_", "NCCL_"))}
             torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=3), device_id=device)
-            ep16(torch, device, rank, record)
+            ep16(torch, device, rank, record, check_readiness=args.phase == "ep16-ready-order")
             torch.distributed.destroy_process_group()
         record["status"] = "pass"
     except BaseException as error:
