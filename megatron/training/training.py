@@ -1132,6 +1132,9 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     report_host_memory('after model+optimizer built')
     config = get_model_config(model[0])
+    # Complete targeted GEMM initialization before the first overlapped schedule.
+    from megatron.training import kda_wgrad_warmup
+    kda_wgrad_warmup.warmup(model, args)
 
     # register state save/restore functions in rerun state machine
     rerun_state_machine = get_rerun_state_machine()

@@ -82,7 +82,21 @@ Set `MEGATRON_COMM_WARMUP=1` on every rank to initialize existing NCCL process g
 The default is disabled, and the hook applies only to immediate model-parallel initialization, not `--lazy-mpu-init`.
 Warmup uses deterministic scratch tensors without consuming random numbers or changing model, optimizer or pipeline settings.
 It does not initialize DeepEP/UCCL token dispatch or qualify concurrent expert execution.
-This startup-only candidate has not yet been GPU-qualified on GH200.
+Completing this initialization does not qualify full-model training.
+
+### Optional KDA weight-gradient initialization
+
+Set `MEGATRON_KDA_WGRAD_WARMUP=1` on every rank to initialize local KDA output-projection weight-gradient GEMMs after model/optimizer construction and before the first overlapped training schedule.
+The default is disabled.
+This targeted CUDA/Transformer Engine hook requires BF16 inputs, FP32 main gradients, TP1 and CP1 without sequence parallelism or global TE FP8.
+MoE expert FP8 computation and dispatch settings are unchanged.
+It deduplicates local projection shapes and executes NT GEMMs for both first-microbatch replacement and subsequent accumulation using private zero inputs and FP32 output.
+The token dimension remains `seq_length * micro_batch_size`, matching the supported native training path.
+No model forward/backward is run, and no parameter, model-gradient, optimizer, router or random-number state is modified.
+Scratch is released after GPU completion, and a final world barrier prevents another rank from starting training before initialization finishes.
+This warms only the selected KDA weight-gradient paths, not every GEMM, expert kernel or communication operation.
+Initialized CUDA process state cannot be transferred through a separately warmed compiler cache.
+The new hook still requires distributed GPU qualification before reference performance is measured.
 
 # Latest News
 
