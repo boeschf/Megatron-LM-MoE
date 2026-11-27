@@ -1102,6 +1102,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_resident_fp8_fnuz_recompute_fc1: bool = False
     """Replay resident native FC1 in backward instead of retaining its quantized preactivation."""
 
+    moe_recompute_post_combine: bool = False
+    """Replay the local BF16 latent projection and shared-expert add before post-MLP RMSNorm
+    backward in the native FNUZ EP overlap schedule."""
+
     moe_use_fp8_activation: bool = False
     """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
     be quantized into FP8 for storage."""
@@ -1993,6 +1997,30 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_resident_fp8_fnuz_recompute_fc1 and not self.moe_resident_fp8_fnuz:
             raise ValueError("FC1 replay requires resident FNUZ experts.")
+
+        if self.moe_recompute_post_combine and (
+            not self.moe_resident_fp8_fnuz
+            or not self.moe_fp8_dispatch_fnuz
+            or not self.bf16
+            or self.tensor_model_parallel_size != 1
+            or self.sequence_parallel
+            or self.enable_autocast
+            or self.quant_recipe is not None
+            or self.use_kitchen
+            or not self.moe_shared_expert_intermediate_size
+            or self.moe_shared_expert_overlap
+            or not self.sandwich_norm
+            or self.normalization != "RMSNorm"
+            or self.fused_residual_rmsnorm
+            or self.keel
+            or self.fp32_residual_connection
+            or self.mtp_num_layers
+            or self.recompute_granularity == "full"
+        ):
+            raise ValueError(
+                "Post-combine replay requires the eager TP1 BF16 native FNUZ EP overlap "
+                "path with non-overlapped shared experts and separate sandwich RMSNorm."
+            )
 
         if self.moe_resident_fp8_fnuz:
             from megatron.core.activations import sssglu_act

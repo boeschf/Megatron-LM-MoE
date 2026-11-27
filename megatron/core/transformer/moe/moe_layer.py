@@ -559,11 +559,26 @@ class MoELayer(BaseMoELayer):
             output = MoEReloadTrigger.apply(output, handle)
         return output
 
-    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+    def postprocess(
+        self,
+        output: torch.Tensor,
+        shared_expert_output: Optional[torch.Tensor],
+        *,
+        checkpoint: Optional[tensor_parallel.CheckpointWithoutOutput] = None,
+    ):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed."""
 
+        # Flex/DeepEP's view reads mutable dispatcher shape metadata. Resolve it in the
+        # original forward, not during replay after other microbatches have run.
         output = self.token_dispatcher.combine_postprocess(output)
+        if checkpoint is not None:
+            return checkpoint.checkpoint(self._project_and_add_shared, output, shared_expert_output)
+        return self._project_and_add_shared(output, shared_expert_output)
+
+    def _project_and_add_shared(
+        self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]
+    ):
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 

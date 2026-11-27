@@ -15,6 +15,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.fp8_jit import (
@@ -735,7 +736,26 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     def submodule_post_combine_forward(node: ScheduleNode, output: torch.Tensor):
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
-        output = layer.mlp.postprocess(output, shared_expert_output)
+        checkpoint = None
+        if layer.config.moe_recompute_post_combine and layer.training and torch.is_grad_enabled():
+            if (
+                isinstance(layer.post_mlp_layernorm, IdentityOp)
+                or shared_expert_output is None
+                or shared_expert_output.dtype != torch.bfloat16
+                or output.dtype != torch.bfloat16
+                or not (output.requires_grad or shared_expert_output.requires_grad)
+            ):
+                raise RuntimeError(
+                    "Post-combine replay needs a differentiable BF16 projection/add "
+                    "boundary and a separate post-MLP norm."
+                )
+            # Per forward, not a module field: several graphs for this layer can be live.
+            checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=None)
+            output = layer.mlp.postprocess(output, shared_expert_output, checkpoint=checkpoint)
+            if output.dtype != torch.bfloat16:
+                raise RuntimeError("Post-combine replay must retain BF16 projection/add rounding.")
+        else:
+            output = layer.mlp.postprocess(output, shared_expert_output)
 
         mlp_output_with_bias = (output, None)
         # Keep the fine-grained MoE path equivalent to TransformerLayer._forward_post_mlp:
@@ -744,6 +764,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             mlp_output_with_bias = layer._apply_post_norm(
                 mlp_output_with_bias, layer.post_mlp_layernorm
             )
+        if checkpoint is not None:
+            trigger = mlp_output_with_bias[0]
+            if not trigger.requires_grad or trigger.untyped_storage() is output.untyped_storage():
+                raise RuntimeError("Post-combine replay needs an independent post-norm output.")
+            # This hook runs upstream of RMSNorm backward on the post-combine stream.
+            # Projection dgrad queues wgrad as usual; the existing MoELayer.backward_dw
+            # call from the MLP node drains it, not this node.
+            checkpoint.discard_output_and_register_recompute(trigger)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
         with layer.bias_dropout_add_exec_handler():
